@@ -12,6 +12,8 @@ watchdog.txt
 
 # Runtime
 nelson.pid
+current_topics.json
+sessions.json
 
 # System prompt (contains personal info)
 CLAUDE.md

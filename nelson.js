@@ -11,6 +11,8 @@ const MEMORY_FILE = path.join(BASE_DIR, 'memory.json');
 const HISTORY_FILE = path.join(BASE_DIR, 'conversation_history.json');
 const PID_FILE = path.join(BASE_DIR, 'nelson.pid');
 const ERROR_LOG = path.join(BASE_DIR, 'error_log.json');
+const TOPICS_FILE = path.join(BASE_DIR, 'current_topics.json');
+const SESSIONS_FILE = path.join(BASE_DIR, 'sessions.json');
 const MAX_HISTORY = 50;
 const CONVERSATIONS_DIR = path.join(
   process.env.HOME, '.claude/projects/-Users-nelson-nelson/memory/conversations'
@@ -138,6 +140,183 @@ function addToHistory(role, text) {
   saveHistory(history);
 }
 
+function loadTopics() {
+  try {
+    const topics = JSON.parse(fs.readFileSync(TOPICS_FILE, 'utf8'));
+    // Reset completed_today if it's a new day
+    const today = new Date().toISOString().split('T')[0];
+    if (topics.last_updated !== today) {
+      topics.completed_today = [];
+      topics.last_updated = today;
+      fs.writeFileSync(TOPICS_FILE, JSON.stringify(topics, null, 2));
+    }
+    return topics;
+  } catch { return { active: [], completed_today: [], last_updated: new Date().toISOString().split('T')[0] }; }
+}
+
+function topicsBlock() {
+  const topics = loadTopics();
+  if (topics.active.length === 0 && topics.completed_today.length === 0) return '';
+  let block = '\n\nActive topics tracker:';
+  if (topics.active.length > 0) block += `\nIN PROGRESS: ${topics.active.join(', ')}`;
+  if (topics.completed_today.length > 0) block += `\nCOMPLETED TODAY: ${topics.completed_today.join(', ')}`;
+  return block;
+}
+
+// --- Session management ---
+const { randomUUID } = require('crypto');
+
+function loadSessions() {
+  try { return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); }
+  catch { return { sessions: {}, active_session: null }; }
+}
+
+function saveSessions(data) {
+  fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+}
+
+function getSession(name) {
+  const data = loadSessions();
+  return data.sessions[name] || null;
+}
+
+function createSession(name) {
+  const data = loadSessions();
+  const id = randomUUID();
+  data.sessions[name] = {
+    id,
+    created: new Date().toISOString(),
+    last_used: new Date().toISOString(),
+    message_count: 0
+  };
+  saveSessions(data);
+  return id;
+}
+
+function touchSession(name) {
+  const data = loadSessions();
+  if (data.sessions[name]) {
+    data.sessions[name].last_used = new Date().toISOString();
+    data.sessions[name].message_count++;
+    data.active_session = name;
+    saveSessions(data);
+  }
+}
+
+function setActiveSession(name) {
+  const data = loadSessions();
+  data.active_session = name;
+  saveSessions(data);
+}
+
+function listSessions() {
+  const data = loadSessions();
+  return Object.entries(data.sessions).map(([name, s]) => ({
+    name,
+    id: s.id,
+    created: s.created,
+    last_used: s.last_used,
+    message_count: s.message_count,
+    active: name === data.active_session
+  }));
+}
+
+function archiveSession(name) {
+  const data = loadSessions();
+  if (!data.sessions[name]) return;
+  // Move to archived list
+  if (!data.archived) data.archived = [];
+  data.archived.push({
+    name,
+    ...data.sessions[name],
+    archived_at: new Date().toISOString()
+  });
+  // Keep last 50 archived sessions
+  if (data.archived.length > 50) data.archived = data.archived.slice(-50);
+  delete data.sessions[name];
+  // If this was active, clear active session
+  if (data.active_session === name) data.active_session = null;
+  saveSessions(data);
+}
+
+function isFirstSessionMessage(name) {
+  const session = getSession(name);
+  return !session || !session.id || session.message_count === 0;
+}
+
+// Auto-generate a short topic name from a message (stateless Claude call)
+async function autoNameSession(text) {
+  try {
+    const prompt = `Generate a short topic name (2-4 words, lowercase, hyphenated) for this message. Examples: "visa-petition", "chess-analysis", "nelson-bug-fix", "property-search". Return ONLY the topic name, nothing else.\n\nMessage: ${text.slice(0, 500)}`;
+    const name = (await callClaudeAsync(prompt, { timeout: 30000 })).trim().toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').slice(0, 50);
+    return name || 'chat-' + Date.now();
+  } catch {
+    return 'chat-' + Date.now();
+  }
+}
+
+// Detect if the user wants to switch to or create a topic session
+// Returns { action: 'switch'|'create'|'none', sessionName: string|null }
+function detectTopicSwitch(text) {
+  const lower = text.toLowerCase().trim();
+
+  // Patterns that indicate switching to an existing topic
+  // These must be fairly explicit to avoid false positives on casual messages
+  const switchPatterns = [
+    /(?:let'?s?\s+)?(?:go\s+)?back\s+to\s+(?:the\s+)?(.+?)(?:\s+(?:topic|session|thing|stuff|work))\s*$/i,
+    /(?:let'?s?\s+)?(?:switch|move|change)\s+(?:to|over\s+to)\s+(?:the\s+)?(.+?)(?:\s+(?:topic|session))?\s*$/i,
+    /(?:let'?s?\s+)?(?:continue|resume|pick\s+up)\s+(?:with\s+)?(?:the\s+)?(.+?)(?:\s+(?:topic|session|work))\s*$/i,
+    /let'?s\s+(?:work\s+on|do)\s+(?:the\s+)?(.+?)(?:\s+(?:again|now))?\s*$/i,
+    /(?:let'?s?\s+)?(?:go\s+back\s+to|return\s+to)\s+(?:the\s+)?(.+)/i,
+    /^(?:back\s+to|resume)\s+(?:the\s+)?(.+)/i,
+  ];
+
+  // Pattern that indicates starting a new topic session
+  const newTopicPatterns = [
+    /(?:let'?s?\s+)?(?:start|begin|open)\s+(?:a\s+)?(?:new\s+)?(?:topic|session)\s+(?:for|on|about|called)\s+(.+)/i,
+    /(?:new\s+topic|new\s+session)\s*[:\-]?\s*(.+)/i,
+  ];
+
+  // Check for new topic creation first
+  for (const pattern of newTopicPatterns) {
+    const match = lower.match(pattern);
+    if (match) {
+      const topicName = match[1].trim().replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').slice(0, 50);
+      if (topicName) return { action: 'create', sessionName: topicName };
+    }
+  }
+
+  // Check for switching to existing topic
+  for (const pattern of switchPatterns) {
+    const match = lower.match(pattern);
+    if (match) {
+      const rawTopic = match[1].trim();
+      // Try to match against existing session names (fuzzy)
+      const data = loadSessions();
+      const sessionNames = Object.keys(data.sessions);
+      // Exact match
+      const normalised = rawTopic.replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-');
+      if (data.sessions[normalised]) return { action: 'switch', sessionName: normalised };
+      // Partial match — check if the raw topic is contained in a session name or vice versa
+      for (const name of sessionNames) {
+        if (name === 'default') continue;
+        if (name.includes(normalised) || normalised.includes(name)) {
+          return { action: 'switch', sessionName: name };
+        }
+        // Also match on space-separated version
+        const spacedName = name.replace(/-/g, ' ');
+        if (rawTopic.includes(spacedName) || spacedName.includes(rawTopic)) {
+          return { action: 'switch', sessionName: name };
+        }
+      }
+      // No existing match — create a new session with this name
+      if (normalised) return { action: 'create', sessionName: normalised };
+    }
+  }
+
+  return { action: 'none', sessionName: null };
+}
+
 function loadRecentJournals(days = 3) {
   try {
     const files = fs.readdirSync(CONVERSATIONS_DIR)
@@ -173,9 +352,26 @@ function downloadFile(url, destPath) {
 }
 
 // Non-blocking Claude call with progress updates and hard timeout
-function callClaudeAsync(input, { timeout = 120000, onProgress } = {}) {
+// sessionName: if provided, uses session mode (--session-id or --resume) instead of --print
+function callClaudeAsync(input, { timeout = 300000, onProgress, sessionName } = {}) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(CLAUDE, ['--print', '--dangerously-skip-permissions'], {
+    // Build args based on session mode
+    let args;
+    if (sessionName) {
+      const session = getSession(sessionName);
+      if (session && session.id) {
+        // Existing session — resume it
+        args = ['--print', '--resume', session.id, '--dangerously-skip-permissions'];
+      } else {
+        // New session — create with a fresh ID
+        const newId = createSession(sessionName);
+        args = ['--print', '--session-id', newId, '--dangerously-skip-permissions'];
+      }
+    } else {
+      args = ['--print', '--dangerously-skip-permissions'];
+    }
+
+    const proc = spawn(CLAUDE, args, {
       cwd: BASE_DIR,
       env: ENV,
       stdio: ['pipe', 'pipe', 'pipe']
@@ -199,8 +395,15 @@ function callClaudeAsync(input, { timeout = 120000, onProgress } = {}) {
       if (killed) {
         reject(new Error('NELSON_TIMEOUT'));
       } else if (code !== 0 && !stdout.trim()) {
-        reject(new Error(stderr || stdout || `Process exited with code ${code}`));
+        const errMsg = stderr || stdout || `Process exited with code ${code}`;
+        // If session-based call failed, mark for rotation
+        if (sessionName && (errMsg.includes('session') || errMsg.includes('context') || errMsg.includes('conversation not found') || code !== 0)) {
+          reject(Object.assign(new Error(errMsg), { sessionFailed: true, sessionName }));
+        } else {
+          reject(new Error(errMsg));
+        }
       } else {
+        if (sessionName) touchSession(sessionName);
         resolve(stdout);
       }
     });
@@ -214,6 +417,41 @@ function callClaudeAsync(input, { timeout = 120000, onProgress } = {}) {
     proc.stdin.write(input);
     proc.stdin.end();
   });
+}
+
+function updateTopicsInBackground(text, result) {
+  (async () => {
+    try {
+      const topics = loadTopics();
+      const prompt = `You are tracking active work topics for Nelson (Lorimer's AI agent). Based on this exchange, update the topic tracker.
+
+Current active topics: ${JSON.stringify(topics.active)}
+Current completed today: ${JSON.stringify(topics.completed_today)}
+
+User said: ${text.slice(0, 1000)}
+Assistant replied: ${result.slice(0, 1000)}
+
+Rules:
+- Add a topic to "active" if Lorimer started or is working on something new (e.g. "computer use setup", "versioning", "code refactor")
+- Move a topic from "active" to "completed_today" if it was clearly finished
+- Keep topic names SHORT (2-5 words)
+- Don't add trivial topics (greetings, quick questions)
+- Maximum 10 active topics — drop oldest if exceeded
+
+Return ONLY valid JSON in this exact format:
+{"active": [...], "completed_today": [...]}`;
+
+      const update = (await callClaudeAsync(prompt, { timeout: 60000 })).trim();
+      const jsonMatch = update.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (Array.isArray(parsed.active) && Array.isArray(parsed.completed_today)) {
+          parsed.last_updated = new Date().toISOString().split('T')[0];
+          fs.writeFileSync(TOPICS_FILE, JSON.stringify(parsed, null, 2));
+        }
+      }
+    } catch {}
+  })();
 }
 
 function updateMemoryInBackground(text, result, memory) {
@@ -336,21 +574,34 @@ function startBot() {
       await downloadFile(fileLink.href, tmpPath);
 
       const memory = loadMemory();
-      const history = loadHistory();
-      const historyBlock = history.length > 0
-        ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text}`).join('\n')}`
-        : '';
-      const journalBlock = loadRecentJournals();
+      const sessionsData = loadSessions();
+      let activeSessionName = sessionsData.active_session;
+      if (!activeSessionName) {
+        activeSessionName = await autoNameSession(caption || 'photo-analysis');
+        setActiveSession(activeSessionName);
+      }
 
-      const imagePrompt = `Here is your memory of the user:\n${JSON.stringify(memory, null, 2)}${journalBlock}${historyBlock}${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
+      let imagePrompt;
+      if (isFirstSessionMessage(activeSessionName)) {
+        const history = loadHistory();
+        const historyBlock = history.length > 0
+          ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text}`).join('\n')}`
+          : '';
+        const journalBlock = loadRecentJournals();
+        const topicsContext = topicsBlock();
+        imagePrompt = `Here is your memory of the user:\n${JSON.stringify(memory, null, 2)}${journalBlock}${topicsContext}${historyBlock}${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
+      } else {
+        imagePrompt = `${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
+      }
 
-      const result = await callClaudeAsync(imagePrompt, { timeout: 120000 });
+      const result = await callClaudeAsync(imagePrompt, { timeout: 300000, sessionName: activeSessionName });
       clearInterval(typingInterval);
       addToHistory('User', `[Photo]${caption ? ` ${caption}` : ''}`);
       addToHistory('Assistant', result);
       const chunks = chunkText(result);
       for (const chunk of chunks) await sendWithRetry(ctx, chunk);
       setImmediate(() => updateMemoryInBackground(caption || '[Photo sent]', result, memory));
+      setImmediate(() => updateTopicsInBackground(caption || '[Photo sent]', result));
       // Clean up temp file
       try { fs.unlinkSync(tmpPath); } catch {}
     } catch (err) {
@@ -471,6 +722,47 @@ function startBot() {
       process.exit(0);
     }
 
+    if (['sessions', 'topics'].includes(text.toLowerCase().trim())) {
+      const sessions = listSessions();
+      if (sessions.length === 0) {
+        await sendWithRetry(ctx, 'No sessions yet.');
+      } else {
+        const lines = sessions.map(s => {
+          const active = s.active ? ' ← *active*' : '';
+          const msgs = s.message_count || 0;
+          const lastUsed = s.last_used ? new Date(s.last_used).toLocaleString('en-GB', { timeZone: 'Europe/London' }) : 'never';
+          return `• *${s.name}* — ${msgs} messages, last used: ${lastUsed}${active}`;
+        }).join('\n');
+        await sendWithRetry(ctx, `*Sessions:*\n\n${lines}\n\nSay "back to [topic]" to switch, "new topic: [name]" to create, or "end session" to close the current one.`);
+      }
+      return;
+    }
+
+    if (text.toLowerCase().trim() === 'end session' || text.toLowerCase().trim() === 'close session') {
+      const data = loadSessions();
+      const current = data.active_session;
+      if (current) {
+        data.active_session = null;
+        saveSessions(data);
+        await sendWithRetry(ctx, `Session "${current}" closed. Next message will start a new topic.`);
+      } else {
+        await sendWithRetry(ctx, 'No active session. Next message will start a new topic.');
+      }
+      return;
+    }
+
+    const rebootKeywords = ['reboot', 'reboot the mac', 'full restart', 'restart the mac', 'restart mac mini', 'reboot mac mini', 'hard reset', 'do a reboot', 'do a full restart'];
+    if (rebootKeywords.some(k => text.toLowerCase().trim().includes(k))) {
+      const REBOOT_SECONDS = 90;
+      const returnTime = new Date(Date.now() + REBOOT_SECONDS * 1000);
+      const timeStr = returnTime.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'Europe/London' });
+      await sendWithRetry(ctx, `Rebooting the Mac Mini now. I should be back by ${timeStr} (~${REBOOT_SECONDS}s). See you on the other side.`).catch(() => {});
+      console.log('Full reboot requested via Telegram');
+      releaseLock();
+      spawn('sudo', ['/sbin/reboot'], { detached: true, stdio: 'ignore' });
+      process.exit(0);
+    }
+
     touchActivity();
     const memory = loadMemory();
 
@@ -498,8 +790,56 @@ function startBot() {
         const origText = orig.text || orig.caption || '[non-text message]';
         replyContext = `\n\n[Lorimer is replying to this earlier message: "${origText.slice(0, 1000)}"]`;
       }
-      const memoryContext = `Here is your memory of the user:\n${JSON.stringify(memory, null, 2)}${journalBlock}${historyBlock}${replyContext}\n\nUser says: ${text}`;
-      const result = await callClaudeAsync(memoryContext, { timeout: 120000 });
+      const topicsContext = topicsBlock();
+
+      // Detect topic switching
+      const topicSwitch = detectTopicSwitch(text);
+      let activeSessionName;
+      let topicSwitchNotice = '';
+
+      if (topicSwitch.action === 'switch') {
+        setActiveSession(topicSwitch.sessionName);
+        activeSessionName = topicSwitch.sessionName;
+        topicSwitchNotice = `\n\n[Session switched to: "${topicSwitch.sessionName}" — resuming previous context for this topic]`;
+      } else if (topicSwitch.action === 'create') {
+        activeSessionName = topicSwitch.sessionName;
+        setActiveSession(activeSessionName);
+        topicSwitchNotice = `\n\n[New topic session created: "${topicSwitch.sessionName}"]`;
+      } else {
+        const sessionsData = loadSessions();
+        activeSessionName = sessionsData.active_session;
+        // No active session — auto-create a new topic session from the message
+        if (!activeSessionName) {
+          activeSessionName = await autoNameSession(text);
+          setActiveSession(activeSessionName);
+          topicSwitchNotice = `\n\n[New topic session created: "${activeSessionName}"]`;
+        }
+      }
+
+      // First message in a session gets full context bootstrap; subsequent messages are lightweight
+      let prompt;
+      if (isFirstSessionMessage(activeSessionName)) {
+        prompt = `Here is your memory of the user:\n${JSON.stringify(memory, null, 2)}${journalBlock}${topicsContext}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
+      } else {
+        // Session already has context — just send the message with minimal framing
+        prompt = `${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
+      }
+
+      let result;
+      try {
+        result = await callClaudeAsync(prompt, { timeout: 300000, sessionName: activeSessionName });
+      } catch (retryErr) {
+        // Session rotation — if the session failed, archive it, create fresh, and retry once
+        if (retryErr.sessionFailed) {
+          console.log(`Session "${activeSessionName}" failed — rotating to new session`);
+          archiveSession(activeSessionName);
+          // Retry with full context since it's a fresh session
+          const freshPrompt = `Here is your memory of the user:\n${JSON.stringify(memory, null, 2)}${journalBlock}${topicsContext}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
+          result = await callClaudeAsync(freshPrompt, { timeout: 300000, sessionName: activeSessionName });
+        } else {
+          throw retryErr;
+        }
+      }
       clearTimeout(progressTimer);
       clearInterval(typingInterval);
       addToHistory('User', text);
@@ -509,6 +849,7 @@ function startBot() {
       repliedSuccessfully = true;
       touchActivity();
       setImmediate(() => updateMemoryInBackground(text, result, memory));
+      setImmediate(() => updateTopicsInBackground(text, result));
     } catch (err) {
       clearTimeout(progressTimer);
       touchActivity();
@@ -516,8 +857,8 @@ function startBot() {
       const msg = (err.message || '') + (err.stderr || '') + (err.stdout || '');
       let reply;
       if (err.message === 'NELSON_TIMEOUT') {
-        reply = 'That was too complex — I hit my 2-minute limit. Try breaking it into a simpler question.';
-        logError('timeout', 'Claude response exceeded 120s', `User message: ${text.slice(0, 200)}`);
+        reply = 'That was too complex — I hit my 5-minute limit. Try breaking it into a simpler question.';
+        logError('timeout', 'Claude response exceeded 300s', `User message: ${text.slice(0, 200)}`);
       } else if (err.killed || msg.includes('ETIMEDOUT') || msg.includes('timed out')) {
         reply = 'That took too long and timed out. Try again or simplify the question.';
         logError('timeout', msg, `User message: ${text.slice(0, 200)}`);
@@ -562,6 +903,9 @@ function startBot() {
 
   bot.launch({
     allowedUpdates: ['message', 'message_reaction', 'message_reaction_count', 'callback_query']
+  }).then(() => {
+    console.log('Nelson is live.');
+    bot.telegram.sendMessage(ALLOWED_USER_ID, 'Nelson is online.').catch(() => {});
   }).catch(err => {
     console.error('Bot crashed:', err.message);
     setTimeout(startBot, 30000);
