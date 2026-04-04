@@ -184,12 +184,16 @@ By default, Nelson keeps the last 20 messages for context. Adjust `MAX_HISTORY` 
 
 ## Versioning
 
-Nelson uses git tags for version control. Each stable release is tagged `v1`, `v2`, `v3`, etc.
+Nelson uses [semantic versioning](https://semver.org/) with git tags.
+
+- **PATCH** (v1.0.1) — bug fixes, small tweaks
+- **MINOR** (v1.1.0) — new features, backwards-compatible changes
+- **MAJOR** (v2.0.0) — breaking changes, major rewrites
 
 To roll back to a previous version:
 
 ```bash
-git checkout v1
+git checkout v1.0.0
 # Restart Nelson after switching versions
 ```
 
