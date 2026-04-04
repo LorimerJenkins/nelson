@@ -419,40 +419,7 @@ function callClaudeAsync(input, { timeout = 300000, onProgress, sessionName } = 
   });
 }
 
-function updateTopicsInBackground(text, result) {
-  (async () => {
-    try {
-      const topics = loadTopics();
-      const prompt = `You are tracking active work topics for Nelson (Lorimer's AI agent). Based on this exchange, update the topic tracker.
-
-Current active topics: ${JSON.stringify(topics.active)}
-Current completed today: ${JSON.stringify(topics.completed_today)}
-
-User said: ${text.slice(0, 1000)}
-Assistant replied: ${result.slice(0, 1000)}
-
-Rules:
-- Add a topic to "active" if Lorimer started or is working on something new (e.g. "computer use setup", "versioning", "code refactor")
-- Move a topic from "active" to "completed_today" if it was clearly finished
-- Keep topic names SHORT (2-5 words)
-- Don't add trivial topics (greetings, quick questions)
-- Maximum 10 active topics — drop oldest if exceeded
-
-Return ONLY valid JSON in this exact format:
-{"active": [...], "completed_today": [...]}`;
-
-      const update = (await callClaudeAsync(prompt, { timeout: 60000 })).trim();
-      const jsonMatch = update.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        const parsed = JSON.parse(jsonMatch[0]);
-        if (Array.isArray(parsed.active) && Array.isArray(parsed.completed_today)) {
-          parsed.last_updated = new Date().toISOString().split('T')[0];
-          fs.writeFileSync(TOPICS_FILE, JSON.stringify(parsed, null, 2));
-        }
-      }
-    } catch {}
-  })();
-}
+// updateTopicsInBackground removed — sessions handle topic context natively
 
 function updateMemoryInBackground(text, result, memory) {
   // Use async calls so we don't block the event loop
@@ -600,8 +567,8 @@ function startBot() {
       addToHistory('Assistant', result);
       const chunks = chunkText(result);
       for (const chunk of chunks) await sendWithRetry(ctx, chunk);
-      setImmediate(() => updateMemoryInBackground(caption || '[Photo sent]', result, memory));
-      setImmediate(() => updateTopicsInBackground(caption || '[Photo sent]', result));
+      // Memory and topics updates removed — saves ~15k tokens per message
+      // Memory updates happen on session close instead
       // Clean up temp file
       try { fs.unlinkSync(tmpPath); } catch {}
     } catch (err) {
@@ -612,41 +579,24 @@ function startBot() {
     }
   });
 
-  // --- Reaction handler ---
+  // --- Reaction handler (no Claude call — saves ~2k tokens per reaction) ---
   bot.on('message_reaction', async (ctx) => {
     try {
-      console.log('RAW reaction update:', JSON.stringify(ctx.update, null, 2));
       const update = ctx.update.message_reaction;
-      if (!update) {
-        console.log('No message_reaction field in update');
-        return;
-      }
-
-      // Check user identity — user field may or may not be present
+      if (!update) return;
       const userId = update.user?.id || ctx.from?.id || update.actor_chat?.id;
       if (userId !== ALLOWED_USER_ID) return;
-
       const newEmojis = (update.new_reaction || [])
         .map(r => r.emoji || r.custom_emoji_id || '?')
         .join(' ');
-      if (!newEmojis) return; // Reaction removed, ignore
-
-      const msgId = update.message_id;
-      const storedMessages = loadHistory();
-
-      const memory = loadMemory();
-      const reactionPrompt = `Here is your memory of the user:\n${JSON.stringify(memory, null, 2)}\n\nRecent conversation:\n${storedMessages.map(m => `${m.role}: ${m.text}`).join('\n')}\n\nLorimer reacted with ${newEmojis} to a message in our chat. The message ID is ${msgId}. Based on our recent conversation, acknowledge the reaction naturally. Keep it very brief — one short sentence max. If it's a thumbs up or similar positive reaction, a simple acknowledgement is fine. Don't overthink it.`;
-
-      const result = await callClaudeAsync(reactionPrompt, { timeout: 30000 });
-      const trimmed = result.trim();
-      if (trimmed && trimmed.length > 0 && trimmed.length < 500) {
-        await botInstance.telegram.sendMessage(update.chat.id, trimmed, { parse_mode: 'Markdown' }).catch(() => {
-          botInstance.telegram.sendMessage(update.chat.id, trimmed).catch(() => {});
-        });
-      }
+      if (!newEmojis) return;
+      // Simple acknowledgement — no Claude call needed
+      const ack = newEmojis.includes('👍') || newEmojis.includes('❤') ? '👍' :
+                  newEmojis.includes('😂') || newEmojis.includes('🤣') ? '😄' :
+                  newEmojis.includes('🎉') ? '🎉' : '👍';
+      await botInstance.telegram.sendMessage(update.chat.id, ack).catch(() => {});
     } catch (err) {
       console.error('Reaction handler error:', err.message);
-      // Don't log or alert for reaction failures — not critical
     }
   });
 
@@ -745,6 +695,12 @@ function startBot() {
         data.active_session = null;
         saveSessions(data);
         await sendWithRetry(ctx, `Session "${current}" closed. Next message will start a new topic.`);
+        // Update memory on session close (instead of per-message)
+        const history = loadHistory();
+        const recentExchanges = history.slice(-10).map(m => `${m.role}: ${m.text}`).join('\n');
+        if (recentExchanges.length > 50) {
+          setImmediate(() => updateMemoryInBackground(recentExchanges, '', loadMemory()));
+        }
       } else {
         await sendWithRetry(ctx, 'No active session. Next message will start a new topic.');
       }
@@ -848,8 +804,8 @@ function startBot() {
       for (const chunk of chunks) await sendWithRetry(ctx, chunk);
       repliedSuccessfully = true;
       touchActivity();
-      setImmediate(() => updateMemoryInBackground(text, result, memory));
-      setImmediate(() => updateTopicsInBackground(text, result));
+      // Memory and topics updates removed — saves ~15k tokens per message
+      // Memory updates happen on session close instead
     } catch (err) {
       clearTimeout(progressTimer);
       touchActivity();
@@ -969,27 +925,6 @@ function scheduleDailyHealthCheck() {
     try { errors = JSON.parse(fs.readFileSync(ERROR_LOG, 'utf8')); } catch {}
     const unresolvedErrors = errors.filter(e => !e.resolved);
 
-    // Gather all project files and their contents for thorough audit
-    const files = fs.readdirSync(BASE_DIR).filter(f => !f.startsWith('.') && !f.startsWith('node_modules'));
-    const fileContents = {};
-    for (const f of files) {
-      const fp = path.join(BASE_DIR, f);
-      try {
-        const stat = fs.statSync(fp);
-        if (stat.isFile() && stat.size < 50000) {
-          fileContents[f] = fs.readFileSync(fp, 'utf8');
-        }
-      } catch {}
-    }
-
-    // Check for referenced files/paths that don't exist
-    let nelsonJs = fileContents['nelson.js'] || '';
-    const referencedPaths = [];
-    const pathMatches = nelsonJs.match(/path\.join\([^)]+\)/g) || [];
-    for (const pm of pathMatches) {
-      referencedPaths.push(pm);
-    }
-
     // Check package.json dependencies vs node_modules
     let depCheck = 'OK';
     try {
@@ -1007,42 +942,23 @@ function scheduleDailyHealthCheck() {
     let processInfo = '';
     try { processInfo = execSync('ps aux | grep "node nelson.js" | grep -v grep', { encoding: 'utf8' }); } catch {}
 
-    // Phase 1: Diagnose and report
-    const diagnosePrompt = `You are Nelson's daily health check system. Today is ${today}. Do a thorough analysis and produce a health report.
+    // Phase 1: Lightweight diagnose — only errors + system status (no full file dumps)
+    const diagnosePrompt = `You are Nelson's daily health check. Today is ${today}. Produce a brief health report.
 
 ## Unresolved Errors (${unresolvedErrors.length})
-${unresolvedErrors.length > 0 ? JSON.stringify(unresolvedErrors.slice(-30), null, 2) : 'None'}
+${unresolvedErrors.length > 0 ? JSON.stringify(unresolvedErrors.slice(-10), null, 2) : 'None'}
 
-## Project Files
-${files.join(', ')}
+## System Status
+- Dependencies: ${depCheck}
+- Process: ${processInfo ? 'Running' : 'NOT FOUND'}
+- Crontab entries: ${crontab.split('\n').filter(l => l.trim()).length}
 
-## File Contents
-${Object.entries(fileContents).map(([name, content]) => `### ${name}\n\`\`\`\n${content.slice(0, 8000)}\n\`\`\``).join('\n\n')}
+Report:
+1. For each error: one-line cause and fix
+2. Any system issues
+3. Overall status: HEALTHY or NEEDS_ATTENTION
 
-## Dependency Check
-${depCheck}
-
-## Crontab
-${crontab}
-
-## Running Processes
-${processInfo}
-
-## Path References in nelson.js
-${referencedPaths.join('\n')}
-
----
-
-Produce a thorough report:
-
-1. **Error Analysis** — for each unresolved error: root cause, severity, and a specific fix (exact code change needed). If none, say so.
-2. **Code Audit** — check ALL files for: broken file references, incorrect path names, logic bugs, potential crashes, race conditions, security issues, missing error handling that could cause silent failures.
-3. **Cross-File Consistency** — do file references match actual file names? Do environment variable names match between .env.example and code? Do package.json scripts reference correct files?
-4. **System Health** — process running correctly, crontab entries valid, dependencies installed, file permissions OK.
-5. **Self-Improvement** — anything about how Nelson works that could be better: response quality, memory handling, conversation flow, error recovery.
-6. **Fix Plan** — for every issue found, provide a specific fix in order of priority. Mark each as AUTO_FIX (safe to apply automatically) or MANUAL_FIX (needs Lorimer's approval).
-
-Be specific and actionable. Reference exact line numbers and file names.`;
+Keep it under 500 words. Only flag real issues.`;
 
     let report = '';
     let fixesApplied = [];
@@ -1059,40 +975,7 @@ Be specific and actionable. Reference exact line numbers and file names.`;
       return;
     }
 
-    // Phase 2: Auto-fix safe issues
-    if (report.includes('AUTO_FIX')) {
-      try {
-        const fixPrompt = `You are Nelson's auto-repair system. Based on this health report, apply all AUTO_FIX items.
-
-## Health Report
-${report}
-
-## Current nelson.js
-${nelsonJs}
-
-For each AUTO_FIX item:
-1. Make the change
-2. Verify the change is safe (won't break the bot)
-3. List what you changed
-
-IMPORTANT: Only fix issues marked AUTO_FIX. Do NOT touch anything marked MANUAL_FIX. Be conservative — if you're not 100% sure a fix is safe, skip it.
-
-After applying fixes, output a summary in this format:
-FIXES_APPLIED:
-- <description of fix 1>
-- <description of fix 2>
-(or "FIXES_APPLIED: none" if nothing was safe to fix)`;
-
-        const fixResult = await callClaudeAsync(fixPrompt, { timeout: 300000 });
-        const fixMatch = fixResult.match(/FIXES_APPLIED:\n([\s\S]*?)(?:\n\n|$)/);
-        if (fixMatch && !fixMatch[1].includes('none')) {
-          fixesApplied = fixMatch[1].split('\n').filter(l => l.trim().startsWith('-')).map(l => l.trim());
-        }
-      } catch (err) {
-        console.error('Auto-fix phase failed:', err.message);
-        logError('health_check_fix', err.message, 'Auto-fix phase failed');
-      }
-    }
+    // Auto-fix phase removed — saves ~50k tokens. Issues flagged to Lorimer instead.
 
     // Mark errors as reviewed
     errors.forEach(e => {
@@ -1100,39 +983,18 @@ FIXES_APPLIED:
     });
     fs.writeFileSync(ERROR_LOG, JSON.stringify(errors, null, 2));
 
-    // Send detailed summary to Lorimer
+    // Send summary to Lorimer
     if (botInstance && ALLOWED_USER_ID) {
       let summary = `*Daily Health Check — ${today}*\n\n`;
-
       if (unresolvedErrors.length === 0) {
-        summary += `No unresolved errors.\n\n`;
+        summary += `No unresolved errors. All systems healthy.\n`;
       } else {
-        summary += `${unresolvedErrors.length} unresolved error(s) found and analysed.\n\n`;
+        summary += `${unresolvedErrors.length} unresolved error(s). Say "health" for details.\n`;
       }
-
-      if (fixesApplied.length > 0) {
-        summary += `*Auto-fixes applied:*\n${fixesApplied.join('\n')}\n\n`;
-      }
-
-      summary += `Say "health" to see the full report.`;
 
       botInstance.telegram.sendMessage(ALLOWED_USER_ID, summary, { parse_mode: 'Markdown' }).catch(() => {
         botInstance.telegram.sendMessage(ALLOWED_USER_ID, summary.replace(/[*_`]/g, '')).catch(() => {});
       });
-
-      // If fixes were applied, restart Nelson to pick them up
-      if (fixesApplied.length > 0) {
-        console.log('Auto-fixes applied, restarting Nelson...');
-        releaseLock();
-        const child = spawn(process.execPath, [__filename], {
-          detached: true,
-          stdio: 'ignore',
-          cwd: BASE_DIR,
-          env: ENV
-        });
-        child.unref();
-        process.exit(0);
-      }
     }
 
     // Schedule next run
