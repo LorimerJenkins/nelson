@@ -28,5 +28,8 @@ memory.json
 # Dependencies
 node_modules/
 
+# Browser automation
+screenshots/
+
 # OS
 .DS_Store
