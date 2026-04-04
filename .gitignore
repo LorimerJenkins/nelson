@@ -1,0 +1,30 @@
+# Secrets
+.env
+
+# User data
+memory.json
+conversation_history.json
+
+# Logs
+nelson.log
+error_log.json
+watchdog.txt
+
+# Runtime
+nelson.pid
+
+# System prompt (contains personal info)
+CLAUDE.md
+
+# Documentation (contains personal operational details)
+NELSON_DOCUMENTATION.md
+
+# Conversation history
+conversation_history.json
+memory.json
+
+# Dependencies
+node_modules/
+
+# OS
+.DS_Store
