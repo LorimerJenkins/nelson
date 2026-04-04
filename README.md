@@ -182,6 +182,23 @@ By default, Nelson keeps the last 20 messages for context. Adjust `MAX_HISTORY` 
 - Only your Telegram user ID can interact with the bot
 - Claude runs with `--dangerously-skip-permissions` — be aware this gives it full system access
 
+## Versioning
+
+Nelson uses git tags for version control. Each stable release is tagged `v1`, `v2`, `v3`, etc.
+
+To roll back to a previous version:
+
+```bash
+git checkout v1
+# Restart Nelson after switching versions
+```
+
+To see all available versions:
+
+```bash
+git tag -l
+```
+
 ## License
 
 MIT
