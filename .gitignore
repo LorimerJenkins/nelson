@@ -7,25 +7,21 @@ conversation_history.json
 
 # Logs
 nelson.log
+nelson.log.*
 error_log.json
 watchdog.txt
 
 # Runtime
 nelson.pid
-current_topics.json
 sessions.json
-usage.json
-tasks.json
+data/
 
 # System prompt (contains personal info)
 CLAUDE.md
+roles/general/CLAUDE.md
 
 # Documentation (contains personal operational details)
 NELSON_DOCUMENTATION.md
-
-# Conversation history
-conversation_history.json
-memory.json
 
 # Dependencies
 node_modules/
@@ -35,3 +31,6 @@ screenshots/
 
 # OS
 .DS_Store
+
+# Health reports
+health_reports/

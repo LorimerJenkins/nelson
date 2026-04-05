@@ -11,15 +11,15 @@ const MEMORY_FILE = path.join(BASE_DIR, 'memory.json');
 const HISTORY_FILE = path.join(BASE_DIR, 'conversation_history.json');
 const PID_FILE = path.join(BASE_DIR, 'nelson.pid');
 const ERROR_LOG = path.join(BASE_DIR, 'error_log.json');
-const TOPICS_FILE = path.join(BASE_DIR, 'current_topics.json');
+const TOPICS_FILE = path.join(BASE_DIR, 'data', 'current_topics.json');
 const SESSIONS_FILE = path.join(BASE_DIR, 'sessions.json');
 const MAX_HISTORY = 10;
 const CONVERSATIONS_DIR = path.join(
   process.env.HOME, '.claude/projects/-Users-nelson-nelson/memory/conversations'
 );
 const os = require('os');
-const usage = require('./usage');
-const tasks = require('./tasks');
+const usage = require('./lib/usage');
+const tasks = require('./lib/tasks');
 const https = require('https');
 const http = require('http');
 const processedMessages = new Set();
@@ -731,7 +731,26 @@ function startBot() {
       return;
     }
 
-    // Detect background task requests
+    // @dev routing — send to Nelson Dev as a background task
+    const devMatch = text.match(/^@dev\s+(.+)/i);
+    if (devMatch) {
+      const devTask = devMatch[1].trim();
+      const memory = loadMemory();
+      const context = `User memory summary: ${JSON.stringify(memory.core || {})}\nBrowser: node ~/nelson/nelson/lib/browse.js goto/screenshot/click/type/text/close\nProjects dir: ~/projects/`;
+      const sendResult = (message) => {
+        const chunks = chunkText(message);
+        for (const chunk of chunks) {
+          botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk, { parse_mode: 'Markdown' }).catch(() => {
+            botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk.replace(/[*_`]/g, '')).catch(() => {});
+          });
+        }
+      };
+      const { taskId, description } = tasks.launchTask(devTask, context, { sendResult, role: 'dev' });
+      await sendWithRetry(ctx, `🛠 *Nelson Dev* task launched: _${description}_\n\nID: \`${taskId}\`\nI'll message you when it's done.\n\nSend "tasks" to check status.`);
+      return;
+    }
+
+    // Detect background task requests (general role)
     const bgPatterns = [
       /^(?:go|please go|nelson go)\s+(.+)/i,
       /^(?:background|bg|task)[:\s]+(.+)/i,
@@ -745,7 +764,7 @@ function startBot() {
     }
     if (bgMatch) {
       const memory = loadMemory();
-      const context = `User memory summary: ${JSON.stringify(memory.core || {})}\nBrowser available: node browse.js goto/screenshot/click/type/text/close`;
+      const context = `User memory summary: ${JSON.stringify(memory.core || {})}\nBrowser: node ~/nelson/nelson/lib/browse.js goto/screenshot/click/type/text/close`;
       const sendResult = (message) => {
         const chunks = chunkText(message);
         for (const chunk of chunks) {
@@ -754,7 +773,7 @@ function startBot() {
           });
         }
       };
-      const { taskId, description } = tasks.launchTask(bgMatch, context, { sendResult });
+      const { taskId, description } = tasks.launchTask(bgMatch, context, { sendResult, role: 'general' });
       await sendWithRetry(ctx, `🚀 Task launched: _${description}_\n\nID: \`${taskId}\`\nI'll message you when it's done. You can keep chatting normally.\n\nSend "tasks" to check status.`);
       return;
     }
