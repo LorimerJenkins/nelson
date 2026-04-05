@@ -18,6 +18,8 @@ const CONVERSATIONS_DIR = path.join(
   process.env.HOME, '.claude/projects/-Users-nelson-nelson/memory/conversations'
 );
 const os = require('os');
+const usage = require('./usage');
+const tasks = require('./tasks');
 const https = require('https');
 const http = require('http');
 const processedMessages = new Set();
@@ -86,7 +88,7 @@ SEVERITY: <low/medium/high>
 
 Be specific — reference function names, line numbers, or exact changes needed. Keep it under 200 words.`;
 
-      const diagnosis = (await callClaudeAsync(prompt, { timeout: 60000 })).trim();
+      const diagnosis = (await callClaudeAsync(prompt, { timeout: 60000, callType: 'error_diagnosis' })).trim();
       let errors = [];
       try { errors = JSON.parse(fs.readFileSync(ERROR_LOG, 'utf8')); } catch {}
       if (errors[index]) {
@@ -248,7 +250,7 @@ function isFirstSessionMessage(name) {
 async function autoNameSession(text) {
   try {
     const prompt = `Generate a short topic name (2-4 words, lowercase, hyphenated) for this message. Examples: "visa-petition", "chess-analysis", "nelson-bug-fix", "property-search". Return ONLY the topic name, nothing else.\n\nMessage: ${text.slice(0, 500)}`;
-    const name = (await callClaudeAsync(prompt, { timeout: 30000 })).trim().toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').slice(0, 50);
+    const name = (await callClaudeAsync(prompt, { timeout: 30000, callType: 'session_name' })).trim().toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').slice(0, 50);
     return name || 'chat-' + Date.now();
   } catch {
     return 'chat-' + Date.now();
@@ -353,8 +355,11 @@ function downloadFile(url, destPath) {
 
 // Non-blocking Claude call with progress updates and hard timeout
 // sessionName: if provided, uses session mode (--session-id or --resume) instead of --print
-function callClaudeAsync(input, { timeout = 300000, onProgress, sessionName } = {}) {
+function callClaudeAsync(input, { timeout = 300000, onProgress, sessionName, callType = 'message' } = {}) {
   return new Promise((resolve, reject) => {
+    // Track usage
+    const estimatedInputTokens = Math.round(input.length / 4);
+    usage.logCall(callType, estimatedInputTokens);
     // Build args based on session mode
     let args;
     if (sessionName) {
@@ -426,7 +431,7 @@ function updateMemoryInBackground(text, result, memory) {
   (async () => {
     try {
       const prompt = `Update this memory JSON if anything important was said. Return ONLY valid JSON.\nCurrent: ${JSON.stringify(memory)}\nUser: ${text}\nAssistant: ${result}`;
-      const update = await callClaudeAsync(prompt, { timeout: 60000 });
+      const update = await callClaudeAsync(prompt, { timeout: 60000, callType: 'memory_update' });
       const jsonMatch = update.match(/\{[\s\S]*\}/);
       if (jsonMatch) saveMemory(JSON.parse(jsonMatch[0]));
     } catch {}
@@ -449,7 +454,7 @@ User said: ${userMsg.slice(0, 3000)}
 
 Assistant replied: ${assistantMsg.slice(0, 3000)}`;
 
-    const summary = (await callClaudeAsync(prompt, { timeout: 60000 })).trim();
+    const summary = (await callClaudeAsync(prompt, { timeout: 60000, callType: 'journal' })).trim();
 
     const entry = `\n### ${timeStr}\n${summary}\n`;
 
@@ -688,6 +693,75 @@ function startBot() {
       return;
     }
 
+    if (text.toLowerCase().trim() === 'usage') {
+      const report = usage.formatUsageReport();
+      await sendWithRetry(ctx, report);
+      return;
+    }
+
+    if (text.toLowerCase().trim() === 'tasks') {
+      const active = tasks.listActiveTasks();
+      const recent = tasks.listRecentTasks(5);
+      let msg = '*Background Tasks*\n\n';
+      if (active.length > 0) {
+        msg += '*Running:*\n';
+        for (const t of active) {
+          const elapsed = Math.round((Date.now() - new Date(t.started_at).getTime()) / 60000);
+          msg += `• \`${t.id}\` — ${t.description} (${elapsed}m)\n`;
+        }
+      } else {
+        msg += 'No tasks running.\n';
+      }
+      if (recent.length > 0) {
+        msg += '\n*Recent:*\n';
+        for (const t of recent) {
+          const icon = t.status === 'completed' ? '✅' : t.status === 'timeout' ? '⏱' : '❌';
+          msg += `${icon} ${t.description}\n`;
+        }
+      }
+      await sendWithRetry(ctx, msg);
+      return;
+    }
+
+    // Cancel a background task
+    if (text.toLowerCase().trim().startsWith('cancel task')) {
+      const taskId = text.trim().split(/\s+/).pop();
+      if (tasks.cancelTask(taskId)) {
+        await sendWithRetry(ctx, `Task \`${taskId}\` cancelled.`);
+      } else {
+        await sendWithRetry(ctx, `No active task with ID \`${taskId}\`.`);
+      }
+      return;
+    }
+
+    // Detect background task requests
+    const bgPatterns = [
+      /^(?:go|please go|nelson go)\s+(.+)/i,
+      /^(?:background|bg|task)[:\s]+(.+)/i,
+      /^(?:in the background)[,:\s]+(.+)/i,
+      /^(?:autonomously|independently)[,:\s]+(.+)/i,
+    ];
+    let bgMatch = null;
+    for (const pattern of bgPatterns) {
+      const m = text.match(pattern);
+      if (m) { bgMatch = m[1].trim(); break; }
+    }
+    if (bgMatch) {
+      const memory = loadMemory();
+      const context = `User memory summary: ${JSON.stringify(memory.core || {})}\nBrowser available: node browse.js goto/screenshot/click/type/text/close`;
+      const sendResult = (message) => {
+        const chunks = chunkText(message);
+        for (const chunk of chunks) {
+          botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk, { parse_mode: 'Markdown' }).catch(() => {
+            botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk.replace(/[*_`]/g, '')).catch(() => {});
+          });
+        }
+      };
+      const { taskId, description } = tasks.launchTask(bgMatch, context, { sendResult });
+      await sendWithRetry(ctx, `🚀 Task launched: _${description}_\n\nID: \`${taskId}\`\nI'll message you when it's done. You can keep chatting normally.\n\nSend "tasks" to check status.`);
+      return;
+    }
+
     if (text.toLowerCase().trim() === 'end session' || text.toLowerCase().trim() === 'close session') {
       const data = loadSessions();
       const current = data.active_session;
@@ -802,6 +876,9 @@ function startBot() {
       addToHistory('Assistant', result);
       const chunks = chunkText(result);
       for (const chunk of chunks) await sendWithRetry(ctx, chunk);
+      // Proactive usage warning
+      const warning = usage.getWarningMessage();
+      if (warning) await sendWithRetry(ctx, warning).catch(() => {});
       repliedSuccessfully = true;
       touchActivity();
       // Memory and topics updates removed — saves ~15k tokens per message
@@ -820,6 +897,7 @@ function startBot() {
         logError('timeout', msg, `User message: ${text.slice(0, 200)}`);
       } else if (msg.includes('Command failed') || msg.includes('usage') || msg.includes('limit') || msg.includes('rate') || msg.includes('capacity')) {
         reply = 'Claude usage limit reached — I\'ll be back once it resets.';
+        usage.logLimitHit();
         logError('usage_limit', 'Claude usage limit reached', `User message: ${text.slice(0, 200)}`);
       } else {
         reply = 'Something went wrong — try again in a moment.';
@@ -964,7 +1042,7 @@ Keep it under 500 words. Only flag real issues.`;
     let fixesApplied = [];
 
     try {
-      report = await callClaudeAsync(diagnosePrompt, { timeout: 300000 });
+      report = await callClaudeAsync(diagnosePrompt, { timeout: 300000, callType: 'health_check' });
       const reportFile = path.join(REPORTS_DIR, `${today}.md`);
       fs.writeFileSync(reportFile, `# Daily Health Report — ${today}\n\n${report}`);
       console.log(`Health report saved to ${reportFile}`);
