@@ -735,8 +735,6 @@ function startBot() {
     const devMatch = text.match(/^@dev\s+(.+)/i);
     if (devMatch) {
       const devTask = devMatch[1].trim();
-      const memory = loadMemory();
-      const context = `User memory summary: ${JSON.stringify(memory.core || {})}\nBrowser: node ~/nelson/nelson/lib/browse.js goto/screenshot/click/type/text/close\nProjects dir: ~/projects/`;
       const sendResult = (message) => {
         const chunks = chunkText(message);
         for (const chunk of chunks) {
@@ -745,6 +743,22 @@ function startBot() {
           });
         }
       };
+
+      // Check for time-based sprint builds: "@dev spend 8 hours building X"
+      const sprintMatch = devTask.match(/(?:spend\s+)?(\d+)\s*(?:hours?|hrs?)\s+(?:building|creating|making|on)\s+(.+)/i);
+      if (sprintMatch) {
+        const hours = parseInt(sprintMatch[1]);
+        const projectDesc = sprintMatch[2].trim();
+        const projectName = projectDesc.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).slice(0, 3).join('-') || 'project';
+        const projectDir = path.join(process.env.HOME, 'projects', projectName);
+        const result = tasks.launchSprintTask(projectDesc, projectDir, { sendResult, sprintMinutes: 30, totalHours: hours });
+        if (result.blocked) return;
+        return;
+      }
+
+      // Regular dev task (no time specified)
+      const memory = loadMemory();
+      const context = `User memory summary: ${JSON.stringify(memory.core || {})}\nBrowser: node ~/nelson/nelson/lib/browse.js goto/screenshot/click/type/text/close\nProjects dir: ~/projects/`;
       const result = tasks.launchTask(devTask, context, { sendResult, role: 'dev' });
       if (result.blocked) return;
       await sendWithRetry(ctx, `🛠 *Nelson Dev* task launched: _${result.description}_\n\nID: \`${result.taskId}\`\nI'll message you when it's done.\n\nSend "tasks" to check status.`);
