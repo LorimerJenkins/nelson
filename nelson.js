@@ -472,7 +472,10 @@ function updateMemoryInBackground(text, result, memory) {
       const prompt = `Update this memory JSON if anything important was said. Return ONLY valid JSON.\nCurrent: ${JSON.stringify(memory)}\nUser: ${text}\nAssistant: ${result}`;
       const update = await callClaudeAsync(prompt, { timeout: 60000, callType: 'memory_update' });
       const jsonMatch = update.match(/\{[\s\S]*\}/);
-      if (jsonMatch) await saveMemoryLocked(JSON.parse(jsonMatch[0]));
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        await hooks.execute('memory_write', () => saveMemoryLocked(parsed), { memoryFile: MEMORY_FILE });
+      }
     } catch {}
     try {
       await saveConversationJournalAsync(text, result);
@@ -643,7 +646,7 @@ function startBot() {
         imagePrompt = `${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
       }
 
-      const result = await callClaudeAsync(imagePrompt, { timeout: 300000, sessionName: activeSessionName });
+      const result = await callClaudeWithRecovery(imagePrompt, { timeout: 300000, sessionName: activeSessionName });
       clearInterval(typingInterval);
       addToHistory('User', `[Photo]${caption ? ` ${caption}` : ''}`);
       addToHistory('Assistant', result);
@@ -992,15 +995,13 @@ function startBot() {
 
       let result;
       try {
-        result = await callClaudeAsync(prompt, { timeout: 300000, sessionName: activeSessionName });
+        result = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
       } catch (retryErr) {
-        // Session rotation — if the session failed, archive it, create fresh, and retry once
-        if (retryErr.sessionFailed) {
-          log.warn('Session failed, rotating', { session: activeSessionName });
-          archiveSession(activeSessionName);
-          // Retry with full context since it's a fresh session
+        // Session rotation — hook already archived the session, retry with fresh context
+        if (retryErr.sessionFailed || classifyError(retryErr) === ERROR_TYPES.SESSION_CORRUPT) {
+          console.log(`Session "${activeSessionName}" failed — retrying with fresh context`);
           const freshPrompt = `Here is your memory of the user:\n${JSON.stringify(memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
-          result = await callClaudeAsync(freshPrompt, { timeout: 300000, sessionName: activeSessionName });
+          result = await callClaudeWithRecovery(freshPrompt, { timeout: 300000, sessionName: activeSessionName });
         } else {
           throw retryErr;
         }
@@ -1022,21 +1023,22 @@ function startBot() {
       clearTimeout(progressTimer);
       touchActivity();
       clearInterval(typingInterval);
-      const msg = (err.message || '') + (err.stderr || '') + (err.stdout || '');
+      // Classify error using hook system (hooks already logged it via error hooks)
+      const errorType = classifyError(err);
       let reply;
-      if (err.message === 'NELSON_TIMEOUT') {
-        reply = 'That was too complex — I hit my 5-minute limit. Try breaking it into a simpler question.';
-        logError('timeout', 'Claude response exceeded 300s', `User message: ${text.slice(0, 200)}`);
-      } else if (err.killed || msg.includes('ETIMEDOUT') || msg.includes('timed out')) {
-        reply = 'That took too long and timed out. Try again or simplify the question.';
-        logError('timeout', msg, `User message: ${text.slice(0, 200)}`);
-      } else if (msg.includes('Command failed') || msg.includes('usage') || msg.includes('limit') || msg.includes('rate') || msg.includes('capacity')) {
+      if (errorType === ERROR_TYPES.TIMEOUT) {
+        reply = 'That was too complex — I hit my time limit. Try breaking it into a simpler question.';
+      } else if (errorType === ERROR_TYPES.RATE_LIMIT) {
         reply = 'Claude usage limit reached — I\'ll be back once it resets.';
-        usage.logLimitHit();
-        logError('usage_limit', 'Claude usage limit reached', `User message: ${text.slice(0, 200)}`);
+      } else if (errorType === ERROR_TYPES.NETWORK) {
+        reply = 'Network issue — try again in a moment.';
+      } else if (errorType === ERROR_TYPES.SESSION_CORRUPT) {
+        reply = 'Session had an issue — it\'s been rotated. Try again.';
+      } else if (err.circuitOpen) {
+        reply = 'Too many recent failures — I\'m cooling down. Try again in a couple of minutes.';
       } else {
         reply = 'Something went wrong — try again in a moment.';
-        logError('unhandled_response', msg, `User message: ${text.slice(0, 200)}`, true);
+        logError('unhandled_response', err.message, `User message: ${text.slice(0, 200)}`, true);
       }
       // Guarantee a reply gets through — try Markdown, then plain text, then raw API
       try {
@@ -1153,6 +1155,9 @@ ${unresolvedErrors.length > 0 ? JSON.stringify(unresolvedErrors.slice(-10), null
 - Dependencies: ${depCheck}
 - Process: ${processInfo ? 'Running' : 'NOT FOUND'}
 - Crontab entries: ${crontab.split('\n').filter(l => l.trim()).length}
+
+## Hook System
+${JSON.stringify(hooks.getStats(), null, 2)}
 
 Report:
 1. For each error: one-line cause and fix
