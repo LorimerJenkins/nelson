@@ -11,6 +11,7 @@ const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ALLOWED_USER_ID = parseInt(process.env.TELEGRAM_ALLOWED_USER_ID);
 const memory_mod = require('./lib/memory');
 const MEMORY_FILE = memory_mod.MEMORY_FILE;
+const memoryTiers = require('./lib/memory-tiers');
 const HISTORY_FILE = path.join(BASE_DIR, 'conversation_history.json');
 const PID_FILE = path.join(BASE_DIR, 'nelson.pid');
 const ERROR_LOG = path.join(BASE_DIR, 'error_log.json');
@@ -641,7 +642,8 @@ function startBot() {
           ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text}`).join('\n')}`
           : '';
         const journalBlock = loadRecentJournals();
-        imagePrompt = `Here is your memory of the user:\n${JSON.stringify(memory)}${journalBlock}${historyBlock}${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
+        const photoMemory = memoryTiers.selectMemory(caption || 'photo');
+        imagePrompt = `Here is your memory of the user:\n${memoryTiers.formatForPrompt(photoMemory.memory)}${journalBlock}${historyBlock}${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
       } else {
         imagePrompt = `${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
       }
@@ -799,6 +801,28 @@ function startBot() {
           const icon = cb.state === 'closed' ? '🟢' : cb.state === 'open' ? '🔴' : '🟡';
           msg += `${icon} \`${name}\`: ${cb.state} (${cb.failures} failures)\n`;
         }
+      }
+      await sendWithRetry(ctx, msg);
+      return;
+    }
+
+    if (text.toLowerCase().trim() === 'memorystats') {
+      const stats = memoryTiers.getTierStats();
+      let msg = '*Memory Tier Stats*\n\n';
+      msg += `Full memory: ~${stats.summary.fullMemoryTokens} tokens\n`;
+      msg += `Hot tier only: ~${stats.summary.hotOnlyTokens} tokens\n`;
+      msg += `Typical savings: ${stats.summary.typicalSavings}\n\n`;
+      msg += '*HOT (always included):*\n';
+      for (const [key, tokens] of Object.entries(stats.hot)) {
+        msg += `  ${key}: ~${tokens} tokens\n`;
+      }
+      msg += '\n*WARM (when relevant):*\n';
+      for (const [name, info] of Object.entries(stats.warm)) {
+        msg += `  ${name}: ~${info.tokens} tokens (${info.triggerCount} triggers)\n`;
+      }
+      msg += '\n*COLD (on demand):*\n';
+      for (const [name, info] of Object.entries(stats.cold)) {
+        msg += `  ${name}: ~${info.tokens} tokens (${info.triggerCount} triggers)\n`;
       }
       await sendWithRetry(ctx, msg);
       return;
@@ -987,7 +1011,9 @@ function startBot() {
       // First message in a session gets full context bootstrap; subsequent messages are lightweight
       let prompt;
       if (isFirstSessionMessage(activeSessionName)) {
-        prompt = `Here is your memory of the user:\n${JSON.stringify(memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
+        const tiered = memoryTiers.selectMemory(text);
+        log.info('memory tiers selected', { tiers: tiered.tiers, tokenEstimate: tiered.tokenEstimate });
+        prompt = `Here is your memory of the user:\n${memoryTiers.formatForPrompt(tiered.memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
       } else {
         // Session already has context — just send the message with minimal framing
         prompt = `${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
@@ -1000,7 +1026,8 @@ function startBot() {
         // Session rotation — hook already archived the session, retry with fresh context
         if (retryErr.sessionFailed || classifyError(retryErr) === ERROR_TYPES.SESSION_CORRUPT) {
           console.log(`Session "${activeSessionName}" failed — retrying with fresh context`);
-          const freshPrompt = `Here is your memory of the user:\n${JSON.stringify(memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
+          const freshTiered = memoryTiers.selectMemory(text, { full: true });
+          const freshPrompt = `Here is your memory of the user:\n${memoryTiers.formatForPrompt(freshTiered.memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
           result = await callClaudeWithRecovery(freshPrompt, { timeout: 300000, sessionName: activeSessionName });
         } else {
           throw retryErr;
