@@ -745,8 +745,9 @@ function startBot() {
           });
         }
       };
-      const { taskId, description } = tasks.launchTask(devTask, context, { sendResult, role: 'dev' });
-      await sendWithRetry(ctx, `🛠 *Nelson Dev* task launched: _${description}_\n\nID: \`${taskId}\`\nI'll message you when it's done.\n\nSend "tasks" to check status.`);
+      const result = tasks.launchTask(devTask, context, { sendResult, role: 'dev' });
+      if (result.blocked) return;
+      await sendWithRetry(ctx, `🛠 *Nelson Dev* task launched: _${result.description}_\n\nID: \`${result.taskId}\`\nI'll message you when it's done.\n\nSend "tasks" to check status.`);
       return;
     }
 
@@ -773,8 +774,9 @@ function startBot() {
           });
         }
       };
-      const { taskId, description } = tasks.launchTask(bgMatch, context, { sendResult, role: 'general' });
-      await sendWithRetry(ctx, `🚀 Task launched: _${description}_\n\nID: \`${taskId}\`\nI'll message you when it's done. You can keep chatting normally.\n\nSend "tasks" to check status.`);
+      const result = tasks.launchTask(bgMatch, context, { sendResult, role: 'general' });
+      if (result.blocked) return;
+      await sendWithRetry(ctx, `🚀 Task launched: _${result.description}_\n\nID: \`${result.taskId}\`\nI'll message you when it's done. You can keep chatting normally.\n\nSend "tasks" to check status.`);
       return;
     }
 
@@ -1136,8 +1138,16 @@ function scheduleDailyUpdater() {
       }
     };
     tasks.launchTask(
-      'Daily Nelson self-improvement scan — review codebase and suggest improvements',
-      'Read all files in ~/nelson/nelson/ (nelson.js, lib/, roles/, CLAUDE.md, package.json). Search the web for latest Claude Code features and personal AI agent techniques. Suggest 3-5 concrete improvements ranked by impact. Format as a Telegram message with emoji headers. Do NOT make any changes — just report suggestions. Each suggestion needs: What, Why, Effort (small/medium/large).',
+      'Daily Nelson self-improvement scan',
+      `Do these three things, then produce a single report:
+
+1. CODEBASE: Read ~/nelson/nelson/ (nelson.js, lib/, roles/). Spot bugs, inefficiencies, missing features.
+
+2. LIFE CONTEXT: Read Lorimer's memory file (~/nelson/nelson/memory.json), recent conversation journals (~/.claude/projects/-Users-nelson-nelson/memory/conversations/), and check his recent emails and calendar. What's he working on? What would help him right now?
+
+3. ECOSYSTEM: Search the web for latest Claude Code updates and personal AI agent techniques relevant to Nelson.
+
+Produce a Telegram report: max 5 suggestions ranked by impact. Each needs: What (one line), Why (reference his actual life/work where relevant), Effort (small/medium/large). Do NOT make any changes.`,
       { sendResult, role: 'updater', timeout: 300000 }
     );
     setTimeout(runUpdater, msUntilNext9am());
