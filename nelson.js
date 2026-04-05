@@ -870,6 +870,151 @@ function startBot() {
   });
 
   // --- Photo handler ---
+  // --- Voice message handler ---
+  bot.on('voice', async (ctx) => {
+    if (ctx.from.id !== ALLOWED_USER_ID) return;
+    const msgId = ctx.message.message_id;
+    if (ctx.message.date < BOT_START_TIME) return;
+    if (processedMessages.has(msgId)) return;
+    processedMessages.set(msgId, Date.now());
+
+    const queued = messageQueue.enqueue(async () => {
+      const typingInterval = setInterval(() => {
+        ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(() => {});
+      }, 5000);
+
+      try {
+        const voice = ctx.message.voice;
+        const fileLink = await ctx.telegram.getFileLink(voice.file_id);
+        const tmpPath = path.join(os.tmpdir(), `nelson_voice_${msgId}.ogg`);
+        await downloadFile(fileLink.href, tmpPath);
+
+        const memory = loadMemory();
+        const sessionsData = loadSessions();
+        let activeSessionName = sessionsData.active_session;
+        if (!activeSessionName) {
+          activeSessionName = 'voice-message';
+          setActiveSession(activeSessionName);
+        }
+
+        const duration = voice.duration || 0;
+        let voicePrompt;
+        if (isFirstSessionMessage(activeSessionName)) {
+          const history = loadHistory();
+          const historyBlock = history.length > 0
+            ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text}`).join('\n')}`
+            : '';
+          const journalBlock = loadRecentJournals();
+          const tiered = memoryTiers.selectMemory('voice message');
+          voicePrompt = `Here is your memory of the user:\n${memoryTiers.formatForPrompt(tiered.memory)}${journalBlock}${historyBlock}\n\nLorimer sent a voice message (${duration}s). The audio file is at: ${tmpPath}\nPlease read/transcribe the audio file and respond to what he said.`;
+        } else {
+          voicePrompt = `Lorimer sent a voice message (${duration}s). The audio file is at: ${tmpPath}\nPlease read/transcribe the audio file and respond to what he said.`;
+        }
+
+        const result = await callClaudeWithRecovery(voicePrompt, { timeout: 300000, sessionName: activeSessionName });
+        clearInterval(typingInterval);
+        addToHistory('User', '[Voice message]');
+        addToHistory('Assistant', result);
+        const chunks = chunkText(result);
+        for (const chunk of chunks) await sendWithRetry(ctx, chunk);
+        try { fs.unlinkSync(tmpPath); } catch {}
+      } catch (err) {
+        clearInterval(typingInterval);
+        log.error('Voice handler error', { err: err.message });
+        logError('voice_handler', err.message, '', true);
+        try { await sendWithRetry(ctx, 'Had trouble with that voice message. Try again or type it out?'); } catch {}
+      }
+    }, { msgId, type: 'voice' });
+
+    if (!queued) {
+      await sendWithRetry(ctx, 'Too many messages queued — give me a moment.').catch(() => {});
+    }
+  });
+
+  // --- Document handler ---
+  bot.on('document', async (ctx) => {
+    if (ctx.from.id !== ALLOWED_USER_ID) return;
+    const msgId = ctx.message.message_id;
+    if (ctx.message.date < BOT_START_TIME) return;
+    if (processedMessages.has(msgId)) return;
+    processedMessages.set(msgId, Date.now());
+
+    const queued = messageQueue.enqueue(async () => {
+      const caption = ctx.message.caption || '';
+      const typingInterval = setInterval(() => {
+        ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(() => {});
+      }, 5000);
+
+      try {
+        const doc = ctx.message.document;
+        const fileName = doc.file_name || 'unknown';
+        const fileSize = doc.file_size || 0;
+
+        // Skip files over 10MB
+        if (fileSize > 10 * 1024 * 1024) {
+          clearInterval(typingInterval);
+          await sendWithRetry(ctx, 'That file is too large (>10MB). Send something smaller or paste the contents.');
+          return;
+        }
+
+        const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+        const ext = path.extname(fileName) || '';
+        const tmpPath = path.join(os.tmpdir(), `nelson_doc_${msgId}${ext}`);
+        await downloadFile(fileLink.href, tmpPath);
+
+        const sessionsData = loadSessions();
+        let activeSessionName = sessionsData.active_session;
+        if (!activeSessionName) {
+          activeSessionName = autoNameSession(caption || fileName);
+          setActiveSession(activeSessionName);
+        }
+
+        let docPrompt;
+        if (isFirstSessionMessage(activeSessionName)) {
+          const history = loadHistory();
+          const historyBlock = history.length > 0
+            ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text}`).join('\n')}`
+            : '';
+          const journalBlock = loadRecentJournals();
+          const tiered = memoryTiers.selectMemory(caption || fileName);
+          docPrompt = `Here is your memory of the user:\n${memoryTiers.formatForPrompt(tiered.memory)}${journalBlock}${historyBlock}\n\nLorimer sent a file: "${fileName}" (${Math.round(fileSize / 1024)}KB). It's saved at: ${tmpPath}\nPlease read/analyse the file and respond.${caption ? `\nCaption: ${caption}` : ''}`;
+        } else {
+          docPrompt = `Lorimer sent a file: "${fileName}" (${Math.round(fileSize / 1024)}KB). It's saved at: ${tmpPath}\nPlease read/analyse the file and respond.${caption ? `\nCaption: ${caption}` : ''}`;
+        }
+
+        const result = await callClaudeWithRecovery(docPrompt, { timeout: 300000, sessionName: activeSessionName });
+        clearInterval(typingInterval);
+        addToHistory('User', `[File: ${fileName}]${caption ? ` ${caption}` : ''}`);
+        addToHistory('Assistant', result);
+        const chunks = chunkText(result);
+        for (const chunk of chunks) await sendWithRetry(ctx, chunk);
+        try { fs.unlinkSync(tmpPath); } catch {}
+      } catch (err) {
+        clearInterval(typingInterval);
+        log.error('Document handler error', { err: err.message });
+        logError('document_handler', err.message, '', true);
+        try { await sendWithRetry(ctx, 'Had trouble with that file. Try again?'); } catch {}
+      }
+    }, { msgId, type: 'document' });
+
+    if (!queued) {
+      await sendWithRetry(ctx, 'Too many messages queued — give me a moment.').catch(() => {});
+    }
+  });
+
+  // --- Sticker handler ---
+  bot.on('sticker', async (ctx) => {
+    if (ctx.from.id !== ALLOWED_USER_ID) return;
+    const msgId = ctx.message.message_id;
+    if (ctx.message.date < BOT_START_TIME) return;
+    if (processedMessages.has(msgId)) return;
+    processedMessages.set(msgId, Date.now());
+    // Just acknowledge stickers — don't waste tokens
+    const emoji = ctx.message.sticker.emoji || '🤷';
+    log.debug('Sticker received', { emoji, msgId });
+  });
+
+  // --- Photo handler ---
   bot.on('photo', async (ctx) => {
     if (ctx.from.id !== ALLOWED_USER_ID) return;
     const msgId = ctx.message.message_id;
@@ -877,63 +1022,64 @@ function startBot() {
     if (processedMessages.has(msgId)) return;
     processedMessages.set(msgId, Date.now());
 
-    const caption = ctx.message.caption || '';
-    // Build reply context if replying to a message
-    let replyContext = '';
-    if (ctx.message.reply_to_message) {
-      const orig = ctx.message.reply_to_message;
-      const origText = orig.text || orig.caption || '[non-text message]';
-      replyContext = `\n\n[Lorimer is replying to this earlier message: "${origText.slice(0, 1000)}"]`;
-    }
-
-    const typingInterval = setInterval(() => {
-      ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(() => {});
-    }, 5000);
-
-    try {
-      // Get the highest resolution photo
-      const photos = ctx.message.photo;
-      const best = photos[photos.length - 1];
-      const fileLink = await ctx.telegram.getFileLink(best.file_id);
-      const tmpPath = path.join(os.tmpdir(), `nelson_photo_${msgId}.jpg`);
-      await downloadFile(fileLink.href, tmpPath);
-
-      const memory = loadMemory();
-      const sessionsData = loadSessions();
-      let activeSessionName = sessionsData.active_session;
-      if (!activeSessionName) {
-        activeSessionName = await autoNameSession(caption || 'photo-analysis');
-        setActiveSession(activeSessionName);
+    const queued = messageQueue.enqueue(async () => {
+      const caption = ctx.message.caption || '';
+      let replyContext = '';
+      if (ctx.message.reply_to_message) {
+        const orig = ctx.message.reply_to_message;
+        const origText = orig.text || orig.caption || '[non-text message]';
+        replyContext = `\n\n[Lorimer is replying to this earlier message: "${origText.slice(0, 1000)}"]`;
       }
 
-      let imagePrompt;
-      if (isFirstSessionMessage(activeSessionName)) {
-        const history = loadHistory();
-        const historyBlock = history.length > 0
-          ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text}`).join('\n')}`
-          : '';
-        const journalBlock = loadRecentJournals();
-        const photoMemory = memoryTiers.selectMemory(caption || 'photo');
-        imagePrompt = `Here is your memory of the user:\n${memoryTiers.formatForPrompt(photoMemory.memory)}${journalBlock}${historyBlock}${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
-      } else {
-        imagePrompt = `${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
-      }
+      const typingInterval = setInterval(() => {
+        ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(() => {});
+      }, 5000);
 
-      const result = await callClaudeWithRecovery(imagePrompt, { timeout: 300000, sessionName: activeSessionName });
-      clearInterval(typingInterval);
-      addToHistory('User', `[Photo]${caption ? ` ${caption}` : ''}`);
-      addToHistory('Assistant', result);
-      const chunks = chunkText(result);
-      for (const chunk of chunks) await sendWithRetry(ctx, chunk);
-      // Memory and topics updates removed — saves ~15k tokens per message
-      // Memory updates happen on session close instead
-      // Clean up temp file
-      try { fs.unlinkSync(tmpPath); } catch {}
-    } catch (err) {
-      clearInterval(typingInterval);
-      log.error('Photo handler error', { err: err.message });
-      logError('photo_handler', err.message, '', true);
-      try { await sendWithRetry(ctx, 'Had trouble processing that image. Try again?'); } catch {}
+      try {
+        const photos = ctx.message.photo;
+        const best = photos[photos.length - 1];
+        const fileLink = await ctx.telegram.getFileLink(best.file_id);
+        const tmpPath = path.join(os.tmpdir(), `nelson_photo_${msgId}.jpg`);
+        await downloadFile(fileLink.href, tmpPath);
+
+        const memory = loadMemory();
+        const sessionsData = loadSessions();
+        let activeSessionName = sessionsData.active_session;
+        if (!activeSessionName) {
+          activeSessionName = await autoNameSession(caption || 'photo-analysis');
+          setActiveSession(activeSessionName);
+        }
+
+        let imagePrompt;
+        if (isFirstSessionMessage(activeSessionName)) {
+          const history = loadHistory();
+          const historyBlock = history.length > 0
+            ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text}`).join('\n')}`
+            : '';
+          const journalBlock = loadRecentJournals();
+          const photoMemory = memoryTiers.selectMemory(caption || 'photo');
+          imagePrompt = `Here is your memory of the user:\n${memoryTiers.formatForPrompt(photoMemory.memory)}${journalBlock}${historyBlock}${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
+        } else {
+          imagePrompt = `${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
+        }
+
+        const result = await callClaudeWithRecovery(imagePrompt, { timeout: 300000, sessionName: activeSessionName });
+        clearInterval(typingInterval);
+        addToHistory('User', `[Photo]${caption ? ` ${caption}` : ''}`);
+        addToHistory('Assistant', result);
+        const chunks = chunkText(result);
+        for (const chunk of chunks) await sendWithRetry(ctx, chunk);
+        try { fs.unlinkSync(tmpPath); } catch {}
+      } catch (err) {
+        clearInterval(typingInterval);
+        log.error('Photo handler error', { err: err.message });
+        logError('photo_handler', err.message, '', true);
+        try { await sendWithRetry(ctx, 'Had trouble processing that image. Try again?'); } catch {}
+      }
+    }, { msgId, type: 'photo' });
+
+    if (!queued) {
+      await sendWithRetry(ctx, 'Too many messages queued — give me a moment.').catch(() => {});
     }
   });
 
@@ -957,10 +1103,10 @@ function startBot() {
   bot.on('text', async (ctx) => {
     if (ctx.from.id !== ALLOWED_USER_ID) return;
     const msgId = ctx.message.message_id;
-    if (ctx.message.date < BOT_START_TIME) return; // Skip messages from before this boot
+    if (ctx.message.date < BOT_START_TIME) return;
     if (processedMessages.has(msgId)) return;
     processedMessages.set(msgId, Date.now());
-    // Prune old message IDs (older than 10 minutes) to prevent unbounded growth
+    // Prune old message IDs (older than 10 minutes)
     const DEDUP_TTL = 10 * 60 * 1000;
     if (processedMessages.size > 100) {
       const cutoff = Date.now() - DEDUP_TTL;
@@ -973,468 +1119,218 @@ function startBot() {
     const reqLog = log.child({ requestId: reqId, msgId, component: 'handler' });
     reqLog.info('message received', { text: text.slice(0, 100) });
 
-    // Top-level safety net — guarantees a reply no matter what goes wrong
-    let repliedSuccessfully = false;
-    try {
-
-    if (text.toLowerCase().trim() === 'errors') {
-      try {
-        let errors = [];
-        try { errors = JSON.parse(fs.readFileSync(ERROR_LOG, 'utf8')); } catch {}
-        const today = new Date().toISOString().split('T')[0];
-        const todayErrors = errors.filter(e => e.timestamp.startsWith(today));
-        if (todayErrors.length === 0) {
-          await sendWithRetry(ctx, 'No errors today.');
-        } else {
-          const summary = todayErrors.map((e, i) => {
-            const time = e.timestamp.split('T')[1].slice(0, 5);
-            let line = `*${i + 1}. ${time}* — \`${e.type}\`\n${e.message.slice(0, 200)}`;
-            if (e.diagnosis) line += `\n_Diagnosis:_ ${e.diagnosis.slice(0, 300)}`;
-            return line;
-          }).join('\n\n');
-          const chunks = chunkText(`*Errors today (${todayErrors.length}):*\n\n${summary}`);
-          for (const chunk of chunks) await sendWithRetry(ctx, chunk);
-        }
-      } catch (err) {
-        await sendWithRetry(ctx, 'Failed to read error log.').catch(() => {});
-      }
-      return;
-    }
-
-    if (text.toLowerCase().trim() === 'health') {
-      try {
-        const REPORTS_DIR = path.join(BASE_DIR, 'health_reports');
-        const files = fs.readdirSync(REPORTS_DIR).filter(f => f.endsWith('.md')).sort();
-        if (files.length === 0) {
-          await sendWithRetry(ctx, 'No health reports yet. First one runs at 8am.');
-        } else {
-          const latest = fs.readFileSync(path.join(REPORTS_DIR, files[files.length - 1]), 'utf8');
-          const chunks = chunkText(latest);
-          for (const chunk of chunks) await sendWithRetry(ctx, chunk);
-        }
-      } catch (err) {
-        await sendWithRetry(ctx, 'Failed to read health report.').catch(() => {});
-      }
-      return;
-    }
-
-    if (text.toLowerCase().trim() === 'restart') {
-      await sendWithRetry(ctx, 'Restarting now...').catch(() => {});
-      log.info('Restart requested via Telegram');
-      releaseLock();
-      const child = spawn(process.execPath, [__filename], {
-        detached: true,
-        stdio: 'ignore',
-        cwd: BASE_DIR,
-        env: ENV
-      });
-      child.unref();
-      process.exit(0);
-    }
-
-    if (['sessions', 'topics'].includes(text.toLowerCase().trim())) {
-      const sessions = listSessions();
-      if (sessions.length === 0) {
-        await sendWithRetry(ctx, 'No sessions yet.');
-      } else {
-        const lines = sessions.map(s => {
-          const active = s.active ? ' ← *active*' : '';
-          const msgs = s.message_count || 0;
-          const lastUsed = s.last_used ? new Date(s.last_used).toLocaleString('en-GB', { timeZone: 'Europe/London' }) : 'never';
-          return `• *${s.name}* — ${msgs} messages, last used: ${lastUsed}${active}`;
-        }).join('\n');
-        await sendWithRetry(ctx, `*Sessions:*\n\n${lines}\n\nSay "back to [topic]" to switch, "new topic: [name]" to create, or "end session" to close the current one.`);
-      }
-      return;
-    }
-
-    if (text.toLowerCase().trim() === 'usage') {
-      const report = usage.formatUsageReport();
-      await sendWithRetry(ctx, report);
-      return;
-    }
-
-    if (text.toLowerCase().trim() === 'hookstatus') {
-      const stats = hooks.getStats();
-      let msg = '*Hook System Status*\n\n';
-      msg += `Calls: ${stats.totalCalls} | Errors: ${stats.totalErrors} | Recoveries: ${stats.totalRecoveries}\n\n`;
-      if (Object.keys(stats.errorsByType).length > 0) {
-        msg += '*Errors by type:*\n';
-        for (const [type, count] of Object.entries(stats.errorsByType)) {
-          msg += `• \`${type}\`: ${count}\n`;
-        }
-        msg += '\n';
-      }
-      if (Object.keys(stats.circuitBreakers).length > 0) {
-        msg += '*Circuit breakers:*\n';
-        for (const [name, cb] of Object.entries(stats.circuitBreakers)) {
-          const icon = cb.state === 'closed' ? '🟢' : cb.state === 'open' ? '🔴' : '🟡';
-          msg += `${icon} \`${name}\`: ${cb.state} (${cb.failures} failures)\n`;
-        }
-      }
-      await sendWithRetry(ctx, msg);
-      return;
-    }
-
-    if (text.toLowerCase().trim() === 'memorystats') {
-      const stats = memoryTiers.getTierStats();
-      let msg = '*Memory Tier Stats*\n\n';
-      msg += `Full memory: ~${stats.summary.fullMemoryTokens} tokens\n`;
-      msg += `Hot tier only: ~${stats.summary.hotOnlyTokens} tokens\n`;
-      msg += `Typical savings: ${stats.summary.typicalSavings}\n\n`;
-      msg += '*HOT (always included):*\n';
-      for (const [key, tokens] of Object.entries(stats.hot)) {
-        msg += `  ${key}: ~${tokens} tokens\n`;
-      }
-      msg += '\n*WARM (when relevant):*\n';
-      for (const [name, info] of Object.entries(stats.warm)) {
-        msg += `  ${name}: ~${info.tokens} tokens (${info.triggerCount} triggers)\n`;
-      }
-      msg += '\n*COLD (on demand):*\n';
-      for (const [name, info] of Object.entries(stats.cold)) {
-        msg += `  ${name}: ~${info.tokens} tokens (${info.triggerCount} triggers)\n`;
-      }
-      await sendWithRetry(ctx, msg);
-      return;
-    }
-
-    if (text.toLowerCase().trim() === 'status') {
-      const uptimeMs = Date.now() - BOOT_TIME;
-      const uptimeH = Math.floor(uptimeMs / 3600000);
-      const uptimeM = Math.floor((uptimeMs % 3600000) / 60000);
-      const memUsage = process.memoryUsage();
-      const heapMB = Math.round(memUsage.heapUsed / 1048576);
-      const rssMB = Math.round(memUsage.rss / 1048576);
-      const sessionsData = loadSessions();
-      const sessionCount = Object.keys(sessionsData.sessions).length;
-      const hookStats = hooks.getStats();
-      const tierStats = memoryTiers.getTierStats();
-      let msg = '*Nelson Status*\n\n';
-      msg += `⏱ Uptime: ${uptimeH}h ${uptimeM}m\n`;
-      msg += `🧠 Memory: ${heapMB}MB heap / ${rssMB}MB RSS\n`;
-      msg += `📋 Sessions: ${sessionCount} active\n`;
-      msg += `🔗 Hook calls: ${hookStats.totalCalls} (${hookStats.totalErrors} errors, ${hookStats.totalRecoveries} recoveries)\n`;
-      msg += `📦 Memory tiers: ${tierStats.summary.hotOnlyTokens} hot tokens, ${tierStats.summary.typicalSavings} savings\n`;
-      msg += `🔄 PID: ${process.pid}\n`;
-      // Circuit breaker summary
-      const breakers = hookStats.circuitBreakers || {};
-      const openBreakers = Object.entries(breakers).filter(([, cb]) => cb.state !== 'closed');
-      if (openBreakers.length > 0) {
-        msg += '\n⚠️ *Open circuit breakers:*\n';
-        for (const [name, cb] of openBreakers) {
-          msg += `  🔴 ${name}: ${cb.state} (${cb.failures} failures)\n`;
-        }
-      } else {
-        msg += '\n🟢 All circuit breakers healthy';
-      }
-      await sendWithRetry(ctx, msg);
-      return;
-    }
-
-    if (text.toLowerCase().trim() === 'tasks') {
-      const active = tasks.listActiveTasks();
-      const recent = tasks.listRecentTasks(5);
-      let msg = '*Background Tasks*\n\n';
-      if (active.length > 0) {
-        msg += '*Running:*\n';
-        for (const t of active) {
-          const elapsed = Math.round((Date.now() - new Date(t.started_at).getTime()) / 60000);
-          msg += `• \`${t.id}\` — ${t.description} (${elapsed}m)\n`;
-        }
-      } else {
-        msg += 'No tasks running.\n';
-      }
-      if (recent.length > 0) {
-        msg += '\n*Recent:*\n';
-        for (const t of recent) {
-          const icon = t.status === 'completed' ? '✅' : t.status === 'timeout' ? '⏱' : '❌';
-          msg += `${icon} ${t.description}\n`;
-        }
-      }
-      await sendWithRetry(ctx, msg);
-      return;
-    }
-
-    // Cancel a background task
-    if (text.toLowerCase().trim().startsWith('cancel task')) {
-      const taskId = text.trim().split(/\s+/).pop();
-      if (tasks.cancelTask(taskId)) {
-        await sendWithRetry(ctx, `Task \`${taskId}\` cancelled.`);
-      } else {
-        await sendWithRetry(ctx, `No active task with ID \`${taskId}\`.`);
-      }
-      return;
-    }
-
-    // @dev routing — send to Nelson Dev as a background task
-    const devMatch = text.match(/^@dev\s+(.+)/i);
-    if (devMatch) {
-      const devTask = devMatch[1].trim();
-      const sendResult = (message) => {
-        const chunks = chunkText(message);
-        for (const chunk of chunks) {
-          botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk, { parse_mode: 'Markdown' }).catch(() => {
-            botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk.replace(/[*_`]/g, '')).catch(() => {});
-          });
-        }
-      };
-
-      // Check for time-based sprint builds: "@dev spend 8 hours building X"
-      const sprintMatch = devTask.match(/(?:spend\s+)?(\d+)\s*(?:hours?|hrs?)\s+(?:building|creating|making|on)\s+(.+)/i);
-      if (sprintMatch) {
-        const hours = parseInt(sprintMatch[1]);
-        const projectDesc = sprintMatch[2].trim();
-        const projectName = projectDesc.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).slice(0, 3).join('-') || 'project';
-        const projectDir = path.join(process.env.HOME, 'projects', projectName);
-        const result = tasks.launchSprintTask(projectDesc, projectDir, { sendResult, sprintMinutes: 30, totalHours: hours });
+    // Shared helpers passed to all command handlers
+    const helpers = {
+      sendReply: sendWithRetry,
+      chunkText,
+      loadMemory,
+      loadHistory,
+      loadSessions,
+      saveSessions,
+      setActiveSession,
+      getSession,
+      archiveSession,
+      isFirstSessionMessage,
+      autoNameSession,
+      detectTopicSwitch,
+      loadRecentJournals,
+      memoryTiers,
+      callClaudeWithRecovery,
+      callClaudeAsync,
+      addToHistory,
+      updateMemoryInBackground,
+      touchActivity,
+      logError,
+      launchBgTask: async (bgCtx, bgText) => {
+        const memory = loadMemory();
+        const context = `User memory summary: ${JSON.stringify(memory.core || {})}\nBrowser: node ~/nelson/nelson/lib/browse.js goto/screenshot/click/type/text/close`;
+        const sendResult = (message) => {
+          const chunks = chunkText(message);
+          for (const chunk of chunks) {
+            botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk, { parse_mode: 'Markdown' }).catch(() => {
+              botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk.replace(/[*_`]/g, '')).catch(() => {});
+            });
+          }
+        };
+        const result = tasks.launchTask(bgText, context, { sendResult, role: 'general' });
         if (result.blocked) return;
-        return;
-      }
+        await sendWithRetry(bgCtx, `🚀 Task launched: _${result.description}_\n\nID: \`${result.taskId}\`\nI'll message you when it's done.\n\nSend "tasks" to check status.`);
+      },
+    };
 
-      // Regular dev task (no time specified)
-      const memory = loadMemory();
-      const context = `User memory summary: ${JSON.stringify(memory.core || {})}\nBrowser: node ~/nelson/nelson/lib/browse.js goto/screenshot/click/type/text/close\nProjects dir: ~/projects/`;
-      const result = tasks.launchTask(devTask, context, { sendResult, role: 'dev' });
-      if (result.blocked) return;
-      await sendWithRetry(ctx, `🛠 *Nelson Dev* task launched: _${result.description}_\n\nID: \`${result.taskId}\`\nI'll message you when it's done.\n\nSend "tasks" to check status.`);
-      return;
-    }
+    // Try command router first — handles all keyword and pattern commands
+    const handled = await router.handle(ctx, text, helpers);
+    if (handled) return;
 
-    // Detect background task requests (general role)
-    const bgPatterns = [
-      /^(?:go|please go|nelson go)\s+(.+)/i,
-      /^(?:background|bg|task)[:\s]+(.+)/i,
-      /^(?:in the background)[,:\s]+(.+)/i,
-      /^(?:autonomously|independently)[,:\s]+(.+)/i,
-    ];
-    let bgMatch = null;
-    for (const pattern of bgPatterns) {
-      const m = text.match(pattern);
-      if (m) { bgMatch = m[1].trim(); break; }
-    }
-    if (bgMatch) {
-      const memory = loadMemory();
-      const context = `User memory summary: ${JSON.stringify(memory.core || {})}\nBrowser: node ~/nelson/nelson/lib/browse.js goto/screenshot/click/type/text/close`;
-      const sendResult = (message) => {
-        const chunks = chunkText(message);
-        for (const chunk of chunks) {
-          botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk, { parse_mode: 'Markdown' }).catch(() => {
-            botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk.replace(/[*_`]/g, '')).catch(() => {});
-          });
-        }
-      };
-      const result = tasks.launchTask(bgMatch, context, { sendResult, role: 'general' });
-      if (result.blocked) return;
-      await sendWithRetry(ctx, `🚀 Task launched: _${result.description}_\n\nID: \`${result.taskId}\`\nI'll message you when it's done. You can keep chatting normally.\n\nSend "tasks" to check status.`);
-      return;
-    }
-
-    if (text.toLowerCase().trim() === 'end session' || text.toLowerCase().trim() === 'close session') {
-      const data = loadSessions();
-      const current = data.active_session;
-      if (current) {
-        data.active_session = null;
-        saveSessions(data);
-        await sendWithRetry(ctx, `Session "${current}" closed. Next message will start a new topic.`);
-        // Update memory on session close (instead of per-message)
-        const history = loadHistory();
-        const recentExchanges = history.slice(-10).map(m => `${m.role}: ${m.text}`).join('\n');
-        if (recentExchanges.length > 50) {
-          setImmediate(() => updateMemoryInBackground(recentExchanges, '', loadMemory()));
-        }
-      } else {
-        await sendWithRetry(ctx, 'No active session. Next message will start a new topic.');
-      }
-      return;
-    }
-
-    const rebootKeywords = ['reboot', 'reboot the mac', 'full restart', 'restart the mac', 'restart mac mini', 'reboot mac mini', 'hard reset', 'do a reboot', 'do a full restart'];
-    if (rebootKeywords.some(k => text.toLowerCase().trim().includes(k))) {
-      const REBOOT_SECONDS = 90;
-      const returnTime = new Date(Date.now() + REBOOT_SECONDS * 1000);
-      const timeStr = returnTime.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'Europe/London' });
-      await sendWithRetry(ctx, `Rebooting the Mac Mini now. I should be back by ${timeStr} (~${REBOOT_SECONDS}s). See you on the other side.`).catch(() => {});
-      log.warn('Full reboot requested via Telegram');
-      releaseLock();
-      spawn('sudo', ['/sbin/reboot'], { detached: true, stdio: 'ignore' });
-      process.exit(0);
-    }
-
-    touchActivity();
-    const memory = loadMemory();
-
-    const typingInterval = setInterval(() => {
-      ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(() => {});
-    }, 5000);
-
-    // Progress message — let Lorimer know if it's taking a while
-    let progressSent = false;
-    const progressTimer = setTimeout(async () => {
-      progressSent = true;
-      await sendWithRetry(ctx, 'Still thinking on this one...').catch(() => {});
-    }, 30000);
-
-    // Declare prompt and activeSessionName outside try block so they're available in catch for rate-limit retry
-    let prompt;
-    let activeSessionName;
-
-    try {
-      const history = loadHistory().slice(-5);
-      const historyBlock = history.length > 0
-        ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text.slice(0, 300)}`).join('\n')}`
-        : '';
-      const journalBlock = loadRecentJournals();
-      // Reply context — if Lorimer is replying to a specific message, include it
-      let replyContext = '';
-      if (ctx.message.reply_to_message) {
-        const orig = ctx.message.reply_to_message;
-        const origText = orig.text || orig.caption || '[non-text message]';
-        replyContext = `\n\n[Lorimer is replying to this earlier message: "${origText.slice(0, 1000)}"]`;
-      }
-      // Detect topic switching
-      const topicSwitch = detectTopicSwitch(text);
-      let topicSwitchNotice = '';
-
-      if (topicSwitch.action === 'switch') {
-        setActiveSession(topicSwitch.sessionName);
-        activeSessionName = topicSwitch.sessionName;
-        topicSwitchNotice = `\n\n[Session switched to: "${topicSwitch.sessionName}" — resuming previous context for this topic]`;
-      } else if (topicSwitch.action === 'create') {
-        activeSessionName = topicSwitch.sessionName;
-        setActiveSession(activeSessionName);
-        topicSwitchNotice = `\n\n[New topic session created: "${topicSwitch.sessionName}"]`;
-      } else {
-        const sessionsData = loadSessions();
-        activeSessionName = sessionsData.active_session;
-        // No active session — auto-create a new topic session from the message
-        if (!activeSessionName) {
-          activeSessionName = await autoNameSession(text);
-          setActiveSession(activeSessionName);
-          topicSwitchNotice = `\n\n[New topic session created: "${activeSessionName}"]`;
-        }
-      }
-
-      // First message in a session gets full context bootstrap; subsequent messages are lightweight
-      if (isFirstSessionMessage(activeSessionName)) {
-        const tiered = memoryTiers.selectMemory(text);
-        log.info('memory tiers selected', { tiers: tiered.tiers, tokenEstimate: tiered.tokenEstimate });
-        prompt = `Here is your memory of the user:\n${memoryTiers.formatForPrompt(tiered.memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
-      } else {
-        // Session already has context — just send the message with minimal framing
-        prompt = `${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
-      }
-
-      let result;
+    // Not a command — queue for Claude conversation processing
+    const queued = messageQueue.enqueue(async () => {
+      let repliedSuccessfully = false;
       try {
-        result = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
-      } catch (retryErr) {
-        // Session rotation — hook already archived the session, retry with fresh context
-        if (retryErr.sessionFailed || classifyError(retryErr) === ERROR_TYPES.SESSION_CORRUPT) {
-          console.log(`Session "${activeSessionName}" failed — retrying with fresh context`);
-          const freshTiered = memoryTiers.selectMemory(text, { full: true });
-          const freshPrompt = `Here is your memory of the user:\n${memoryTiers.formatForPrompt(freshTiered.memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
-          result = await callClaudeWithRecovery(freshPrompt, { timeout: 300000, sessionName: activeSessionName });
-        } else {
-          throw retryErr;
-        }
-      }
-      clearTimeout(progressTimer);
-      clearInterval(typingInterval);
-      addToHistory('User', text);
-      addToHistory('Assistant', result);
-      const chunks = chunkText(result);
-      for (const chunk of chunks) await sendWithRetry(ctx, chunk);
-      // Proactive usage warning
-      const warning = usage.getWarningMessage();
-      if (warning) await sendWithRetry(ctx, warning).catch(() => {});
-      repliedSuccessfully = true;
-      touchActivity();
-      // Auto-rotate session at 15 messages to prevent token bloat
-      const currentSession = getSession(activeSessionName);
-      if (currentSession && currentSession.message_count >= 15) {
-        archiveSession(activeSessionName);
-        const data = loadSessions();
-        data.active_session = null;
-        saveSessions(data);
-        log.info('Session auto-rotated', { session: activeSessionName, messages: currentSession.message_count });
-      }
-    } catch (err) {
-      clearTimeout(progressTimer);
-      touchActivity();
-      clearInterval(typingInterval);
-      // Classify error using hook system (hooks already logged it via error hooks)
-      const errorType = classifyError(err);
-      let reply;
-      if (errorType === ERROR_TYPES.TIMEOUT) {
-        reply = 'That was too complex — I hit my time limit. Try breaking it into a simpler question.';
-      } else if (errorType === ERROR_TYPES.RATE_LIMIT) {
-        usage.logLimitHit();
-        // Auto-retry: wait 5 minutes and try once more (prompt + activeSessionName available from outer scope)
-        if (prompt && activeSessionName) {
-          await sendWithRetry(ctx, '⏸️ Token limit hit. Waiting 5 minutes then retrying automatically...').catch(() => {});
-          await new Promise(r => setTimeout(r, 5 * 60 * 1000));
+        touchActivity();
+
+        const typingInterval = setInterval(() => {
+          ctx.telegram.sendChatAction(ctx.chat.id, 'typing').catch(() => {});
+        }, 5000);
+
+        let progressSent = false;
+        const progressTimer = setTimeout(async () => {
+          progressSent = true;
+          await sendWithRetry(ctx, 'Still thinking on this one...').catch(() => {});
+        }, 30000);
+
+        let prompt;
+        let activeSessionName;
+
+        try {
+          const history = loadHistory().slice(-5);
+          const historyBlock = history.length > 0
+            ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text.slice(0, 300)}`).join('\n')}`
+            : '';
+          const journalBlock = loadRecentJournals();
+          let replyContext = '';
+          if (ctx.message.reply_to_message) {
+            const orig = ctx.message.reply_to_message;
+            const origText = orig.text || orig.caption || '[non-text message]';
+            replyContext = `\n\n[Lorimer is replying to this earlier message: "${origText.slice(0, 1000)}"]`;
+          }
+          const topicSwitch = detectTopicSwitch(text);
+          let topicSwitchNotice = '';
+
+          if (topicSwitch.action === 'switch') {
+            setActiveSession(topicSwitch.sessionName);
+            activeSessionName = topicSwitch.sessionName;
+            topicSwitchNotice = `\n\n[Session switched to: "${topicSwitch.sessionName}" — resuming previous context for this topic]`;
+          } else if (topicSwitch.action === 'create') {
+            activeSessionName = topicSwitch.sessionName;
+            setActiveSession(activeSessionName);
+            topicSwitchNotice = `\n\n[New topic session created: "${topicSwitch.sessionName}"]`;
+          } else {
+            const sessionsData = loadSessions();
+            activeSessionName = sessionsData.active_session;
+            if (!activeSessionName) {
+              activeSessionName = await autoNameSession(text);
+              setActiveSession(activeSessionName);
+              topicSwitchNotice = `\n\n[New topic session created: "${activeSessionName}"]`;
+            }
+          }
+
+          if (isFirstSessionMessage(activeSessionName)) {
+            const tiered = memoryTiers.selectMemory(text);
+            log.info('memory tiers selected', { tiers: tiered.tiers, tokenEstimate: tiered.tokenEstimate });
+            prompt = `Here is your memory of the user:\n${memoryTiers.formatForPrompt(tiered.memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
+          } else {
+            prompt = `${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
+          }
+
+          let result;
           try {
-            const retryResult = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
-            addToHistory('User', text);
-            addToHistory('Assistant', retryResult);
-            const retryChunks = chunkText(retryResult);
-            for (const chunk of retryChunks) await sendWithRetry(ctx, chunk);
+            result = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
+          } catch (retryErr) {
+            if (retryErr.sessionFailed || classifyError(retryErr) === ERROR_TYPES.SESSION_CORRUPT) {
+              console.log(`Session "${activeSessionName}" failed — retrying with fresh context`);
+              const freshTiered = memoryTiers.selectMemory(text, { full: true });
+              const freshPrompt = `Here is your memory of the user:\n${memoryTiers.formatForPrompt(freshTiered.memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
+              result = await callClaudeWithRecovery(freshPrompt, { timeout: 300000, sessionName: activeSessionName });
+            } else {
+              throw retryErr;
+            }
+          }
+          clearTimeout(progressTimer);
+          clearInterval(typingInterval);
+          addToHistory('User', text);
+          addToHistory('Assistant', result);
+          const chunks = chunkText(result);
+          for (const chunk of chunks) await sendWithRetry(ctx, chunk);
+          const warning = usage.getWarningMessage();
+          if (warning) await sendWithRetry(ctx, warning).catch(() => {});
+          repliedSuccessfully = true;
+          touchActivity();
+          // Auto-rotate session at 15 messages
+          const currentSession = getSession(activeSessionName);
+          if (currentSession && currentSession.message_count >= 15) {
+            archiveSession(activeSessionName);
+            const data = loadSessions();
+            data.active_session = null;
+            saveSessions(data);
+            log.info('Session auto-rotated', { session: activeSessionName, messages: currentSession.message_count });
+          }
+        } catch (err) {
+          clearTimeout(progressTimer);
+          touchActivity();
+          clearInterval(typingInterval);
+          const errorType = classifyError(err);
+          let reply;
+          if (errorType === ERROR_TYPES.TIMEOUT) {
+            reply = 'That was too complex — I hit my time limit. Try breaking it into a simpler question.';
+          } else if (errorType === ERROR_TYPES.RATE_LIMIT) {
+            usage.logLimitHit();
+            if (prompt && activeSessionName) {
+              await sendWithRetry(ctx, '⏸️ Token limit hit. Waiting 5 minutes then retrying automatically...').catch(() => {});
+              await new Promise(r => setTimeout(r, 5 * 60 * 1000));
+              try {
+                const retryResult = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
+                addToHistory('User', text);
+                addToHistory('Assistant', retryResult);
+                const retryChunks = chunkText(retryResult);
+                for (const chunk of retryChunks) await sendWithRetry(ctx, chunk);
+                repliedSuccessfully = true;
+                touchActivity();
+                return;
+              } catch (retryErr2) {
+                await sendWithRetry(ctx, '⏸️ Still limited. Waiting 15 more minutes...').catch(() => {});
+                await new Promise(r => setTimeout(r, 15 * 60 * 1000));
+                try {
+                  const retry2Result = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
+                  addToHistory('User', text);
+                  addToHistory('Assistant', retry2Result);
+                  const retry2Chunks = chunkText(retry2Result);
+                  for (const chunk of retry2Chunks) await sendWithRetry(ctx, chunk);
+                  repliedSuccessfully = true;
+                  touchActivity();
+                  return;
+                } catch {
+                  // Give up after two retries
+                }
+              }
+            }
+            reply = 'Token limit still active after retrying. I\'ll be back once it fully resets.';
+          } else if (errorType === ERROR_TYPES.NETWORK) {
+            reply = 'Network issue — try again in a moment.';
+          } else if (errorType === ERROR_TYPES.SESSION_CORRUPT) {
+            reply = 'Session had an issue — it\'s been rotated. Try again.';
+          } else if (err.circuitOpen) {
+            reply = 'Too many recent failures — I\'m cooling down. Try again in a couple of minutes.';
+          } else {
+            reply = 'Something went wrong — try again in a moment.';
+            logError('unhandled_response', err.message, `User message: ${text.slice(0, 200)}`, true);
+          }
+          try {
+            await sendWithRetry(ctx, reply);
             repliedSuccessfully = true;
-            touchActivity();
-            return;
-          } catch (retryErr2) {
-            // Still limited — wait longer
-            await sendWithRetry(ctx, '⏸️ Still limited. Waiting 15 more minutes...').catch(() => {});
-            await new Promise(r => setTimeout(r, 15 * 60 * 1000));
+          } catch {
             try {
-              const retry2Result = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
-              addToHistory('User', text);
-              addToHistory('Assistant', retry2Result);
-              const retry2Chunks = chunkText(retry2Result);
-              for (const chunk of retry2Chunks) await sendWithRetry(ctx, chunk);
+              await ctx.reply(reply);
               repliedSuccessfully = true;
-              touchActivity();
-              return;
-            } catch {
-              // Give up after two retries
+            } catch (finalErr) {
+              log.fatal('Failed to send ANY reply', { err: finalErr.message });
+              logError('reply_failure', finalErr.message, `Reply was: ${reply}`);
             }
           }
         }
-        reply = 'Token limit still active after retrying. I\'ll be back once it fully resets.';
-      } else if (errorType === ERROR_TYPES.NETWORK) {
-        reply = 'Network issue — try again in a moment.';
-      } else if (errorType === ERROR_TYPES.SESSION_CORRUPT) {
-        reply = 'Session had an issue — it\'s been rotated. Try again.';
-      } else if (err.circuitOpen) {
-        reply = 'Too many recent failures — I\'m cooling down. Try again in a couple of minutes.';
-      } else {
-        reply = 'Something went wrong — try again in a moment.';
-        logError('unhandled_response', err.message, `User message: ${text.slice(0, 200)}`, true);
-      }
-      // Guarantee a reply gets through — try Markdown, then plain text, then raw API
-      try {
-        await sendWithRetry(ctx, reply);
-        repliedSuccessfully = true;
-      } catch {
-        try {
-          await ctx.reply(reply);
-          repliedSuccessfully = true;
-        } catch (finalErr) {
-          log.fatal('Failed to send ANY reply', { err: finalErr.message });
-          logError('reply_failure', finalErr.message, `Reply was: ${reply}`);
+      } catch (outerErr) {
+        log.error('Top-level handler crash', { err: outerErr.message });
+        logError('handler_crash', outerErr.message, outerErr.stack ? outerErr.stack.slice(0, 500) : '', true);
+        if (!repliedSuccessfully) {
+          try { await ctx.reply('Something went wrong internally. Try again or send "restart" if I seem stuck.'); } catch {}
         }
       }
-    }
+    }, { msgId, type: 'text', text: text.slice(0, 50) });
 
-    } catch (outerErr) {
-      // Top-level safety net — no matter what goes wrong, always try to reply
-      log.error('Top-level handler crash', { err: outerErr.message });
-      logError('handler_crash', outerErr.message, outerErr.stack ? outerErr.stack.slice(0, 500) : '', true);
-      if (!repliedSuccessfully) {
-        try { await ctx.reply('Something went wrong internally. Try again or send "restart" if I seem stuck.'); } catch {}
-      }
+    if (!queued) {
+      await sendWithRetry(ctx, 'Too many messages queued — give me a moment to catch up.').catch(() => {});
     }
   });
+
 
   // Log all raw updates for debugging
   bot.use((ctx, next) => {
