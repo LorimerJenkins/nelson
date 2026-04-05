@@ -13,7 +13,7 @@ const PID_FILE = path.join(BASE_DIR, 'nelson.pid');
 const ERROR_LOG = path.join(BASE_DIR, 'error_log.json');
 const TOPICS_FILE = path.join(BASE_DIR, 'current_topics.json');
 const SESSIONS_FILE = path.join(BASE_DIR, 'sessions.json');
-const MAX_HISTORY = 50;
+const MAX_HISTORY = 10;
 const CONVERSATIONS_DIR = path.join(
   process.env.HOME, '.claude/projects/-Users-nelson-nelson/memory/conversations'
 );
@@ -246,15 +246,12 @@ function isFirstSessionMessage(name) {
   return !session || !session.id || session.message_count === 0;
 }
 
-// Auto-generate a short topic name from a message (stateless Claude call)
-async function autoNameSession(text) {
-  try {
-    const prompt = `Generate a short topic name (2-4 words, lowercase, hyphenated) for this message. Examples: "visa-petition", "chess-analysis", "nelson-bug-fix", "property-search". Return ONLY the topic name, nothing else.\n\nMessage: ${text.slice(0, 500)}`;
-    const name = (await callClaudeAsync(prompt, { timeout: 30000, callType: 'session_name' })).trim().toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').slice(0, 50);
-    return name || 'chat-' + Date.now();
-  } catch {
-    return 'chat-' + Date.now();
-  }
+// Auto-generate a short topic name from keywords (no Claude call — saves ~500 tokens)
+function autoNameSession(text) {
+  const stopWords = new Set(['i','me','my','the','a','an','is','are','was','were','be','been','do','does','did','have','has','had','will','would','could','should','can','may','to','of','in','for','on','with','at','by','from','it','this','that','and','or','but','not','so','if','then','what','how','when','where','who','which','there','here','just','about','up','out','you','your','we','our','they','them','he','she','its','some','any','all','no','yes','ok','please','go','get','let','lets','make','want','need','know','think','look','also','hey','hi','hello','nelson','tell','show','give']);
+  const words = text.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2 && !stopWords.has(w));
+  const name = words.slice(0, 3).join('-') || 'chat-' + Date.now();
+  return name.slice(0, 50);
 }
 
 // Detect if the user wants to switch to or create a topic session
@@ -319,15 +316,16 @@ function detectTopicSwitch(text) {
   return { action: 'none', sessionName: null };
 }
 
-function loadRecentJournals(days = 3) {
+function loadRecentJournals(days = 1) {
   try {
     const files = fs.readdirSync(CONVERSATIONS_DIR)
       .filter(f => f.endsWith('.md'))
       .sort()
       .slice(-days);
     if (files.length === 0) return '';
+    // Only load last 1500 chars of today's journal — keeps context tight
     const entries = files.map(f =>
-      fs.readFileSync(path.join(CONVERSATIONS_DIR, f), 'utf8').slice(0, 3000)
+      fs.readFileSync(path.join(CONVERSATIONS_DIR, f), 'utf8').slice(-1500)
     ).join('\n\n');
     return `\n\nRecent conversation journals:\n${entries}`;
   } catch { return ''; }
@@ -560,8 +558,7 @@ function startBot() {
           ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text}`).join('\n')}`
           : '';
         const journalBlock = loadRecentJournals();
-        const topicsContext = topicsBlock();
-        imagePrompt = `Here is your memory of the user:\n${JSON.stringify(memory, null, 2)}${journalBlock}${topicsContext}${historyBlock}${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
+        imagePrompt = `Here is your memory of the user:\n${JSON.stringify(memory)}${journalBlock}${historyBlock}${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
       } else {
         imagePrompt = `${replyContext}\n\nLorimer sent a photo. The image is saved at: ${tmpPath}\nPlease read the image file at that path to see what it contains.\n${caption ? `Caption: ${caption}` : 'No caption provided.'}\n\nRespond naturally based on what you see in the image${caption ? ' and the caption' : ''}.`;
       }
@@ -808,9 +805,9 @@ function startBot() {
     }, 30000);
 
     try {
-      const history = loadHistory();
+      const history = loadHistory().slice(-10);
       const historyBlock = history.length > 0
-        ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text}`).join('\n')}`
+        ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text.slice(0, 500)}`).join('\n')}`
         : '';
       const journalBlock = loadRecentJournals();
       // Reply context — if Lorimer is replying to a specific message, include it
@@ -820,8 +817,6 @@ function startBot() {
         const origText = orig.text || orig.caption || '[non-text message]';
         replyContext = `\n\n[Lorimer is replying to this earlier message: "${origText.slice(0, 1000)}"]`;
       }
-      const topicsContext = topicsBlock();
-
       // Detect topic switching
       const topicSwitch = detectTopicSwitch(text);
       let activeSessionName;
@@ -849,7 +844,7 @@ function startBot() {
       // First message in a session gets full context bootstrap; subsequent messages are lightweight
       let prompt;
       if (isFirstSessionMessage(activeSessionName)) {
-        prompt = `Here is your memory of the user:\n${JSON.stringify(memory, null, 2)}${journalBlock}${topicsContext}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
+        prompt = `Here is your memory of the user:\n${JSON.stringify(memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
       } else {
         // Session already has context — just send the message with minimal framing
         prompt = `${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
@@ -864,7 +859,7 @@ function startBot() {
           console.log(`Session "${activeSessionName}" failed — rotating to new session`);
           archiveSession(activeSessionName);
           // Retry with full context since it's a fresh session
-          const freshPrompt = `Here is your memory of the user:\n${JSON.stringify(memory, null, 2)}${journalBlock}${topicsContext}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
+          const freshPrompt = `Here is your memory of the user:\n${JSON.stringify(memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
           result = await callClaudeAsync(freshPrompt, { timeout: 300000, sessionName: activeSessionName });
         } else {
           throw retryErr;
