@@ -7,7 +7,8 @@ const path = require('path');
 const BASE_DIR = __dirname;
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ALLOWED_USER_ID = parseInt(process.env.TELEGRAM_ALLOWED_USER_ID);
-const MEMORY_FILE = path.join(BASE_DIR, 'memory.json');
+const memory_mod = require('./lib/memory');
+const MEMORY_FILE = memory_mod.MEMORY_FILE;
 const HISTORY_FILE = path.join(BASE_DIR, 'conversation_history.json');
 const PID_FILE = path.join(BASE_DIR, 'nelson.pid');
 const ERROR_LOG = path.join(BASE_DIR, 'error_log.json');
@@ -116,15 +117,11 @@ if (!TOKEN || !ALLOWED_USER_ID) {
   process.exit(1);
 }
 
-function loadMemory() {
-  try { return JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8')); }
-  catch { return {}; }
-}
-
-function saveMemory(memory) {
-  memory.last_updated = new Date().toISOString().split('T')[0];
-  fs.writeFileSync(MEMORY_FILE, JSON.stringify(memory, null, 2));
-}
+// Memory functions — delegated to lib/memory.js (with file locking)
+const loadMemory = memory_mod.loadMemory;
+const saveMemory = memory_mod.saveMemory;
+const saveMemoryLocked = memory_mod.saveMemoryLocked;
+const updateMemoryLocked = memory_mod.updateMemoryLocked;
 
 function loadHistory() {
   try { return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); }
@@ -431,7 +428,7 @@ function updateMemoryInBackground(text, result, memory) {
       const prompt = `Update this memory JSON if anything important was said. Return ONLY valid JSON.\nCurrent: ${JSON.stringify(memory)}\nUser: ${text}\nAssistant: ${result}`;
       const update = await callClaudeAsync(prompt, { timeout: 60000, callType: 'memory_update' });
       const jsonMatch = update.match(/\{[\s\S]*\}/);
-      if (jsonMatch) saveMemory(JSON.parse(jsonMatch[0]));
+      if (jsonMatch) await saveMemoryLocked(JSON.parse(jsonMatch[0]));
     } catch {}
     try {
       await saveConversationJournalAsync(text, result);
