@@ -937,7 +937,10 @@ function startBot() {
     bot.telegram.sendMessage(ALLOWED_USER_ID, 'Nelson is online.').catch(() => {});
   }).catch(err => {
     console.error('Bot crashed:', err.message);
-    setTimeout(startBot, 30000);
+    // 409 = another instance still connected — wait longer for Telegram to release
+    const delay = err.message.includes('409') ? 60000 : 30000;
+    console.log(`Retrying in ${delay / 1000}s...`);
+    setTimeout(startBot, delay);
   });
 
   process.once('SIGINT', () => { releaseLock(); bot.stop('SIGINT'); });
