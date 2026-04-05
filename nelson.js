@@ -27,8 +27,10 @@ const tasks = require('./lib/tasks');
 const { hooks, retryWithBackoff, classifyError, ERROR_TYPES } = require('./lib/hooks');
 const https = require('https');
 const http = require('http');
-const processedMessages = new Set();
+// Map of msgId → timestamp for dedup with TTL-based cleanup
+const processedMessages = new Map();
 const BOT_START_TIME = Math.floor(Date.now() / 1000);
+const BOOT_TIME = Date.now();
 const CLAUDE = process.env.CLAUDE_PATH || 'claude';
 const ENV = { ...process.env, PATH: `${path.dirname(CLAUDE)}:/usr/local/bin:/usr/bin:/bin` };
 
@@ -604,7 +606,7 @@ function startBot() {
     const msgId = ctx.message.message_id;
     if (ctx.message.date < BOT_START_TIME) return;
     if (processedMessages.has(msgId)) return;
-    processedMessages.add(msgId);
+    processedMessages.set(msgId, Date.now());
 
     const caption = ctx.message.caption || '';
     // Build reply context if replying to a message
@@ -666,7 +668,7 @@ function startBot() {
     }
   });
 
-  // --- Reaction handler (no Claude call — saves ~2k tokens per reaction) ---
+  // --- Reaction handler (silent — just log, don't spam back) ---
   bot.on('message_reaction', async (ctx) => {
     try {
       const update = ctx.update.message_reaction;
@@ -677,11 +679,7 @@ function startBot() {
         .map(r => r.emoji || r.custom_emoji_id || '?')
         .join(' ');
       if (!newEmojis) return;
-      // Simple acknowledgement — no Claude call needed
-      const ack = newEmojis.includes('👍') || newEmojis.includes('❤') ? '👍' :
-                  newEmojis.includes('😂') || newEmojis.includes('🤣') ? '😄' :
-                  newEmojis.includes('🎉') ? '🎉' : '👍';
-      await botInstance.telegram.sendMessage(update.chat.id, ack).catch(() => {});
+      log.debug('Reaction received', { emojis: newEmojis });
     } catch (err) {
       log.warn('Reaction handler error', { err: err.message });
     }
@@ -692,11 +690,14 @@ function startBot() {
     const msgId = ctx.message.message_id;
     if (ctx.message.date < BOT_START_TIME) return; // Skip messages from before this boot
     if (processedMessages.has(msgId)) return;
-    processedMessages.add(msgId);
-    // Keep set from growing forever — prune old IDs
-    if (processedMessages.size > 200) {
-      const iter = processedMessages.values();
-      for (let i = 0; i < 100; i++) processedMessages.delete(iter.next().value);
+    processedMessages.set(msgId, Date.now());
+    // Prune old message IDs (older than 10 minutes) to prevent unbounded growth
+    const DEDUP_TTL = 10 * 60 * 1000;
+    if (processedMessages.size > 100) {
+      const cutoff = Date.now() - DEDUP_TTL;
+      for (const [id, ts] of processedMessages) {
+        if (ts < cutoff) processedMessages.delete(id);
+      }
     }
     const text = ctx.message.text;
     const reqId = log.requestId();
@@ -823,6 +824,39 @@ function startBot() {
       msg += '\n*COLD (on demand):*\n';
       for (const [name, info] of Object.entries(stats.cold)) {
         msg += `  ${name}: ~${info.tokens} tokens (${info.triggerCount} triggers)\n`;
+      }
+      await sendWithRetry(ctx, msg);
+      return;
+    }
+
+    if (text.toLowerCase().trim() === 'status') {
+      const uptimeMs = Date.now() - BOOT_TIME;
+      const uptimeH = Math.floor(uptimeMs / 3600000);
+      const uptimeM = Math.floor((uptimeMs % 3600000) / 60000);
+      const memUsage = process.memoryUsage();
+      const heapMB = Math.round(memUsage.heapUsed / 1048576);
+      const rssMB = Math.round(memUsage.rss / 1048576);
+      const sessionsData = loadSessions();
+      const sessionCount = Object.keys(sessionsData.sessions).length;
+      const hookStats = hooks.getStats();
+      const tierStats = memoryTiers.getTierStats();
+      let msg = '*Nelson Status*\n\n';
+      msg += `⏱ Uptime: ${uptimeH}h ${uptimeM}m\n`;
+      msg += `🧠 Memory: ${heapMB}MB heap / ${rssMB}MB RSS\n`;
+      msg += `📋 Sessions: ${sessionCount} active\n`;
+      msg += `🔗 Hook calls: ${hookStats.totalCalls} (${hookStats.totalErrors} errors, ${hookStats.totalRecoveries} recoveries)\n`;
+      msg += `📦 Memory tiers: ${tierStats.summary.hotOnlyTokens} hot tokens, ${tierStats.summary.typicalSavings} savings\n`;
+      msg += `🔄 PID: ${process.pid}\n`;
+      // Circuit breaker summary
+      const breakers = hookStats.circuitBreakers || {};
+      const openBreakers = Object.entries(breakers).filter(([, cb]) => cb.state !== 'closed');
+      if (openBreakers.length > 0) {
+        msg += '\n⚠️ *Open circuit breakers:*\n';
+        for (const [name, cb] of openBreakers) {
+          msg += `  🔴 ${name}: ${cb.state} (${cb.failures} failures)\n`;
+        }
+      } else {
+        msg += '\n🟢 All circuit breakers healthy';
       }
       await sendWithRetry(ctx, msg);
       return;
@@ -971,6 +1005,10 @@ function startBot() {
       await sendWithRetry(ctx, 'Still thinking on this one...').catch(() => {});
     }, 30000);
 
+    // Declare prompt and activeSessionName outside try block so they're available in catch for rate-limit retry
+    let prompt;
+    let activeSessionName;
+
     try {
       const history = loadHistory().slice(-5);
       const historyBlock = history.length > 0
@@ -986,7 +1024,6 @@ function startBot() {
       }
       // Detect topic switching
       const topicSwitch = detectTopicSwitch(text);
-      let activeSessionName;
       let topicSwitchNotice = '';
 
       if (topicSwitch.action === 'switch') {
@@ -1009,7 +1046,6 @@ function startBot() {
       }
 
       // First message in a session gets full context bootstrap; subsequent messages are lightweight
-      let prompt;
       if (isFirstSessionMessage(activeSessionName)) {
         const tiered = memoryTiers.selectMemory(text);
         log.info('memory tiers selected', { tiers: tiered.tiers, tokenEstimate: tiered.tokenEstimate });
@@ -1064,33 +1100,35 @@ function startBot() {
         reply = 'That was too complex — I hit my time limit. Try breaking it into a simpler question.';
       } else if (errorType === ERROR_TYPES.RATE_LIMIT) {
         usage.logLimitHit();
-        // Auto-retry: wait 5 minutes and try once more
-        await sendWithRetry(ctx, '⏸️ Token limit hit. Waiting 5 minutes then retrying automatically...').catch(() => {});
-        await new Promise(r => setTimeout(r, 5 * 60 * 1000));
-        try {
-          const retryResult = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
-          addToHistory('User', text);
-          addToHistory('Assistant', retryResult);
-          const retryChunks = chunkText(retryResult);
-          for (const chunk of retryChunks) await sendWithRetry(ctx, chunk);
-          repliedSuccessfully = true;
-          touchActivity();
-          return;
-        } catch (retryErr2) {
-          // Still limited — wait longer
-          await sendWithRetry(ctx, '⏸️ Still limited. Waiting 15 more minutes...').catch(() => {});
-          await new Promise(r => setTimeout(r, 15 * 60 * 1000));
+        // Auto-retry: wait 5 minutes and try once more (prompt + activeSessionName available from outer scope)
+        if (prompt && activeSessionName) {
+          await sendWithRetry(ctx, '⏸️ Token limit hit. Waiting 5 minutes then retrying automatically...').catch(() => {});
+          await new Promise(r => setTimeout(r, 5 * 60 * 1000));
           try {
-            const retry2Result = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
+            const retryResult = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
             addToHistory('User', text);
-            addToHistory('Assistant', retry2Result);
-            const retry2Chunks = chunkText(retry2Result);
-            for (const chunk of retry2Chunks) await sendWithRetry(ctx, chunk);
+            addToHistory('Assistant', retryResult);
+            const retryChunks = chunkText(retryResult);
+            for (const chunk of retryChunks) await sendWithRetry(ctx, chunk);
             repliedSuccessfully = true;
             touchActivity();
             return;
-          } catch {
-            // Give up after two retries
+          } catch (retryErr2) {
+            // Still limited — wait longer
+            await sendWithRetry(ctx, '⏸️ Still limited. Waiting 15 more minutes...').catch(() => {});
+            await new Promise(r => setTimeout(r, 15 * 60 * 1000));
+            try {
+              const retry2Result = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
+              addToHistory('User', text);
+              addToHistory('Assistant', retry2Result);
+              const retry2Chunks = chunkText(retry2Result);
+              for (const chunk of retry2Chunks) await sendWithRetry(ctx, chunk);
+              repliedSuccessfully = true;
+              touchActivity();
+              return;
+            } catch {
+              // Give up after two retries
+            }
           }
         }
         reply = 'Token limit still active after retrying. I\'ll be back once it fully resets.';
@@ -1149,8 +1187,20 @@ function startBot() {
     setTimeout(startBot, delay);
   });
 
-  process.once('SIGINT', () => { releaseLock(); bot.stop('SIGINT'); });
-  process.once('SIGTERM', () => { releaseLock(); bot.stop('SIGTERM'); });
+  process.once('SIGINT', () => gracefulShutdown('SIGINT'));
+  process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+}
+
+// Graceful shutdown handler — logs uptime and cleans up
+function gracefulShutdown(signal) {
+  const uptimeMs = Date.now() - BOOT_TIME;
+  const uptimeMin = Math.round(uptimeMs / 60000);
+  log.info('Shutting down', { signal, uptimeMinutes: uptimeMin, pid: process.pid });
+  releaseLock();
+  if (botInstance) {
+    try { botInstance.stop(signal); } catch {}
+  }
+  process.exit(0);
 }
 
 process.on('uncaughtException', (err) => {
@@ -1195,7 +1245,7 @@ function scheduleDailyHealthCheck() {
     // Check package.json dependencies vs node_modules
     let depCheck = 'OK';
     try {
-      const pkg = JSON.parse(fileContents['package.json'] || '{}');
+      const pkg = JSON.parse(fs.readFileSync(path.join(BASE_DIR, 'package.json'), 'utf8'));
       const deps = Object.keys(pkg.dependencies || {});
       const missing = deps.filter(d => !fs.existsSync(path.join(BASE_DIR, 'node_modules', d)));
       if (missing.length > 0) depCheck = `Missing: ${missing.join(', ')}`;
@@ -1280,12 +1330,16 @@ function touchActivity() { lastActivityTime = Date.now(); }
 
 function startWatchdog() {
   setInterval(() => {
-    const idleMinutes = (Date.now() - lastActivityTime) / 60000;
-    // If idle for more than 10 minutes and the process has been running for at least 15 min, that's fine — no messages
-    // But we write the timestamp so the cron health check can verify we're alive
+    // Write heartbeat so external watchdog can verify we're alive
     const watchdogFile = path.join(BASE_DIR, 'watchdog.txt');
-    fs.writeFileSync(watchdogFile, `${Date.now()}\n${process.pid}`);
+    const uptimeMs = Date.now() - BOOT_TIME;
+    fs.writeFileSync(watchdogFile, `${Date.now()}\n${process.pid}\n${uptimeMs}`);
   }, 60000); // Write heartbeat every minute
+
+  // Periodic log rotation — every 6 hours
+  setInterval(() => {
+    log.rotateIfNeeded();
+  }, 6 * 3600000);
 }
 
 // Daily updater — runs at 9am UK time, suggests improvements
@@ -1379,6 +1433,7 @@ function scheduleDailyLifeSync() {
 }
 
 log.info('Nelson starting up', { pid: process.pid });
+log.rotateIfNeeded();
 startBot();
 scheduleDailyHealthCheck();
 scheduleDailyUpdater();
