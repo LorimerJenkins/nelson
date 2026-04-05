@@ -1113,7 +1113,41 @@ function startWatchdog() {
   }, 60000); // Write heartbeat every minute
 }
 
+// Daily updater — runs at 9am UK time, suggests improvements
+function scheduleDailyUpdater() {
+  function msUntilNext9am() {
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(9, 0, 0, 0);
+    if (now >= next) next.setDate(next.getDate() + 1);
+    return next - now;
+  }
+
+  function runUpdater() {
+    console.log('Running daily updater...');
+    const sendResult = (message) => {
+      if (botInstance && ALLOWED_USER_ID) {
+        const chunks = chunkText(message);
+        for (const chunk of chunks) {
+          botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk, { parse_mode: 'Markdown' }).catch(() => {
+            botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk.replace(/[*_`]/g, '')).catch(() => {});
+          });
+        }
+      }
+    };
+    tasks.launchTask(
+      'Daily Nelson self-improvement scan — review codebase and suggest improvements',
+      'Read all files in ~/nelson/nelson/ (nelson.js, lib/, roles/, CLAUDE.md, package.json). Search the web for latest Claude Code features and personal AI agent techniques. Suggest 3-5 concrete improvements ranked by impact. Format as a Telegram message with emoji headers. Do NOT make any changes — just report suggestions. Each suggestion needs: What, Why, Effort (small/medium/large).',
+      { sendResult, role: 'updater', timeout: 300000 }
+    );
+    setTimeout(runUpdater, msUntilNext9am());
+  }
+
+  setTimeout(runUpdater, msUntilNext9am());
+}
+
 console.log('Nelson is running...');
 startBot();
 scheduleDailyHealthCheck();
+scheduleDailyUpdater();
 startWatchdog();
