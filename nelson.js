@@ -25,6 +25,8 @@ const os = require('os');
 const usage = require('./lib/usage');
 const tasks = require('./lib/tasks');
 const { hooks, retryWithBackoff, classifyError, ERROR_TYPES } = require('./lib/hooks');
+const { MessageQueue } = require('./lib/queue');
+const { CommandRouter } = require('./lib/commands');
 const https = require('https');
 const http = require('http');
 // Map of msgId → timestamp for dedup with TTL-based cleanup
@@ -33,6 +35,9 @@ const BOT_START_TIME = Math.floor(Date.now() / 1000);
 const BOOT_TIME = Date.now();
 const CLAUDE = process.env.CLAUDE_PATH || 'claude';
 const ENV = { ...process.env, PATH: `${path.dirname(CLAUDE)}:/usr/local/bin:/usr/bin:/bin` };
+
+// Message queue — processes messages sequentially to prevent interleaving
+const messageQueue = new MessageQueue({ concurrency: 1, maxDepth: 20, timeout: 360000 });
 
 // PID lock — prevent duplicate instances
 function acquireLock() {
@@ -583,6 +588,270 @@ hooks.on('claude_call', 'error', async (err, context) => {
   console.log(`Hook: claude_call error [${type}]: ${err.message.slice(0, 200)}`);
   logError(type, err.message, `callType: ${context.callType || 'unknown'}, session: ${context.sessionName || 'none'}`);
   return null;
+});
+
+// --- Command Router Setup ---
+const router = new CommandRouter();
+
+// Register all keyword commands
+router.command('errors', 'Show today\'s errors', async (ctx, h) => {
+  let errors = [];
+  try { errors = JSON.parse(fs.readFileSync(ERROR_LOG, 'utf8')); } catch {}
+  const today = new Date().toISOString().split('T')[0];
+  const todayErrors = errors.filter(e => e.timestamp.startsWith(today));
+  if (todayErrors.length === 0) {
+    await h.sendReply(ctx, 'No errors today.');
+  } else {
+    const summary = todayErrors.map((e, i) => {
+      const time = e.timestamp.split('T')[1].slice(0, 5);
+      let line = `*${i + 1}. ${time}* — \`${e.type}\`\n${e.message.slice(0, 200)}`;
+      if (e.diagnosis) line += `\n_Diagnosis:_ ${e.diagnosis.slice(0, 300)}`;
+      return line;
+    }).join('\n\n');
+    const chunks = chunkText(`*Errors today (${todayErrors.length}):*\n\n${summary}`);
+    for (const chunk of chunks) await h.sendReply(ctx, chunk);
+  }
+});
+
+router.command('health', 'Show latest health report', async (ctx, h) => {
+  const REPORTS_DIR = path.join(BASE_DIR, 'health_reports');
+  const files = fs.readdirSync(REPORTS_DIR).filter(f => f.endsWith('.md')).sort();
+  if (files.length === 0) {
+    await h.sendReply(ctx, 'No health reports yet. First one runs at 8am.');
+  } else {
+    const latest = fs.readFileSync(path.join(REPORTS_DIR, files[files.length - 1]), 'utf8');
+    const chunks = chunkText(latest);
+    for (const chunk of chunks) await h.sendReply(ctx, chunk);
+  }
+});
+
+router.command('restart', 'Restart Nelson process', async (ctx, h) => {
+  await h.sendReply(ctx, 'Restarting now...').catch(() => {});
+  log.info('Restart requested via Telegram');
+  releaseLock();
+  const child = spawn(process.execPath, [__filename], {
+    detached: true, stdio: 'ignore', cwd: BASE_DIR, env: ENV
+  });
+  child.unref();
+  process.exit(0);
+});
+
+router.command(['sessions', 'topics'], 'List active sessions', async (ctx, h) => {
+  const sessions = listSessions();
+  if (sessions.length === 0) {
+    await h.sendReply(ctx, 'No sessions yet.');
+  } else {
+    const lines = sessions.map(s => {
+      const active = s.active ? ' ← *active*' : '';
+      const msgs = s.message_count || 0;
+      const lastUsed = s.last_used ? new Date(s.last_used).toLocaleString('en-GB', { timeZone: 'Europe/London' }) : 'never';
+      return `• *${s.name}* — ${msgs} messages, last used: ${lastUsed}${active}`;
+    }).join('\n');
+    await h.sendReply(ctx, `*Sessions:*\n\n${lines}\n\nSay "back to [topic]" to switch, "new topic: [name]" to create, or "end session" to close the current one.`);
+  }
+});
+
+router.command('usage', 'Show token usage', async (ctx, h) => {
+  await h.sendReply(ctx, usage.formatUsageReport());
+});
+
+router.command('hookstatus', 'Show hook system status', async (ctx, h) => {
+  const stats = hooks.getStats();
+  let msg = '*Hook System Status*\n\n';
+  msg += `Calls: ${stats.totalCalls} | Errors: ${stats.totalErrors} | Recoveries: ${stats.totalRecoveries}\n\n`;
+  if (Object.keys(stats.errorsByType).length > 0) {
+    msg += '*Errors by type:*\n';
+    for (const [type, count] of Object.entries(stats.errorsByType)) {
+      msg += `• \`${type}\`: ${count}\n`;
+    }
+    msg += '\n';
+  }
+  if (Object.keys(stats.circuitBreakers).length > 0) {
+    msg += '*Circuit breakers:*\n';
+    for (const [name, cb] of Object.entries(stats.circuitBreakers)) {
+      const icon = cb.state === 'closed' ? '🟢' : cb.state === 'open' ? '🔴' : '🟡';
+      msg += `${icon} \`${name}\`: ${cb.state} (${cb.failures} failures)\n`;
+    }
+  }
+  await h.sendReply(ctx, msg);
+});
+
+router.command('memorystats', 'Show memory tier stats', async (ctx, h) => {
+  const stats = memoryTiers.getTierStats();
+  let msg = '*Memory Tier Stats*\n\n';
+  msg += `Full memory: ~${stats.summary.fullMemoryTokens} tokens\n`;
+  msg += `Hot tier only: ~${stats.summary.hotOnlyTokens} tokens\n`;
+  msg += `Typical savings: ${stats.summary.typicalSavings}\n\n`;
+  msg += '*HOT (always included):*\n';
+  for (const [key, tokens] of Object.entries(stats.hot)) {
+    msg += `  ${key}: ~${tokens} tokens\n`;
+  }
+  msg += '\n*WARM (when relevant):*\n';
+  for (const [name, info] of Object.entries(stats.warm)) {
+    msg += `  ${name}: ~${info.tokens} tokens (${info.triggerCount} triggers)\n`;
+  }
+  msg += '\n*COLD (on demand):*\n';
+  for (const [name, info] of Object.entries(stats.cold)) {
+    msg += `  ${name}: ~${info.tokens} tokens (${info.triggerCount} triggers)\n`;
+  }
+  await h.sendReply(ctx, msg);
+});
+
+router.command('status', 'Show Nelson status', async (ctx, h) => {
+  const uptimeMs = Date.now() - BOOT_TIME;
+  const uptimeH = Math.floor(uptimeMs / 3600000);
+  const uptimeM = Math.floor((uptimeMs % 3600000) / 60000);
+  const memUsage = process.memoryUsage();
+  const heapMB = Math.round(memUsage.heapUsed / 1048576);
+  const rssMB = Math.round(memUsage.rss / 1048576);
+  const sessionsData = loadSessions();
+  const sessionCount = Object.keys(sessionsData.sessions).length;
+  const hookStats = hooks.getStats();
+  const tierStats = memoryTiers.getTierStats();
+  const queueStats = messageQueue.getStats();
+  let msg = '*Nelson Status*\n\n';
+  msg += `⏱ Uptime: ${uptimeH}h ${uptimeM}m\n`;
+  msg += `🧠 Memory: ${heapMB}MB heap / ${rssMB}MB RSS\n`;
+  msg += `📋 Sessions: ${sessionCount} active\n`;
+  msg += `🔗 Hook calls: ${hookStats.totalCalls} (${hookStats.totalErrors} errors, ${hookStats.totalRecoveries} recoveries)\n`;
+  msg += `📦 Memory tiers: ${tierStats.summary.hotOnlyTokens} hot tokens, ${tierStats.summary.typicalSavings} savings\n`;
+  msg += `📨 Queue: ${queueStats.processed} processed, ${queueStats.dropped} dropped, ${queueStats.timeouts} timeouts\n`;
+  msg += `🔄 PID: ${process.pid}\n`;
+  const breakers = hookStats.circuitBreakers || {};
+  const openBreakers = Object.entries(breakers).filter(([, cb]) => cb.state !== 'closed');
+  if (openBreakers.length > 0) {
+    msg += '\n⚠️ *Open circuit breakers:*\n';
+    for (const [name, cb] of openBreakers) {
+      msg += `  🔴 ${name}: ${cb.state} (${cb.failures} failures)\n`;
+    }
+  } else {
+    msg += '\n🟢 All circuit breakers healthy';
+  }
+  await h.sendReply(ctx, msg);
+});
+
+router.command('tasks', 'Show background tasks', async (ctx, h) => {
+  const active = tasks.listActiveTasks();
+  const recent = tasks.listRecentTasks(5);
+  let msg = '*Background Tasks*\n\n';
+  if (active.length > 0) {
+    msg += '*Running:*\n';
+    for (const t of active) {
+      const elapsed = Math.round((Date.now() - new Date(t.started_at).getTime()) / 60000);
+      msg += `• \`${t.id}\` — ${t.description} (${elapsed}m)\n`;
+    }
+  } else {
+    msg += 'No tasks running.\n';
+  }
+  if (recent.length > 0) {
+    msg += '\n*Recent:*\n';
+    for (const t of recent) {
+      const icon = t.status === 'completed' ? '✅' : t.status === 'timeout' ? '⏱' : '❌';
+      msg += `${icon} ${t.description}\n`;
+    }
+  }
+  await h.sendReply(ctx, msg);
+});
+
+router.command('help', 'Show available commands', async (ctx, h) => {
+  const cmds = router.listCommands();
+  let msg = '*Nelson Commands*\n\n';
+  for (const { keywords, description } of cmds) {
+    msg += `• *${keywords[0]}* — ${description}\n`;
+  }
+  msg += '\n*Routing:*\n';
+  msg += '• *@dev [task]* — send to Nelson Dev\n';
+  msg += '• *@dev [N] hours building [X]* — sprint build\n';
+  msg += '• *go [task]* — background task\n';
+  msg += '\n*Session:*\n';
+  msg += '• *new topic: [name]* — start a topic\n';
+  msg += '• *back to [topic]* — switch topic\n';
+  msg += '• *end session* — close current topic\n';
+  await h.sendReply(ctx, msg);
+});
+
+router.command(['end session', 'close session'], 'Close current session', async (ctx, h) => {
+  const data = loadSessions();
+  const current = data.active_session;
+  if (current) {
+    data.active_session = null;
+    saveSessions(data);
+    await h.sendReply(ctx, `Session "${current}" closed. Next message will start a new topic.`);
+    const history = loadHistory();
+    const recentExchanges = history.slice(-10).map(m => `${m.role}: ${m.text}`).join('\n');
+    if (recentExchanges.length > 50) {
+      setImmediate(() => updateMemoryInBackground(recentExchanges, '', loadMemory()));
+    }
+  } else {
+    await h.sendReply(ctx, 'No active session. Next message will start a new topic.');
+  }
+});
+
+// Pattern: cancel task
+router.pattern(/^cancel\s+task\s+(\S+)/i, 'Cancel a background task', async (ctx, h, match) => {
+  const taskId = match[1];
+  if (tasks.cancelTask(taskId)) {
+    await h.sendReply(ctx, `Task \`${taskId}\` cancelled.`);
+  } else {
+    await h.sendReply(ctx, `No active task with ID \`${taskId}\`.`);
+  }
+});
+
+// Pattern: @dev routing
+router.pattern(/^@dev\s+(.+)/i, 'Dev task routing', async (ctx, h, match) => {
+  const devTask = match[1].trim();
+  const sendResult = (message) => {
+    const chunks = chunkText(message);
+    for (const chunk of chunks) {
+      botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk, { parse_mode: 'Markdown' }).catch(() => {
+        botInstance.telegram.sendMessage(ALLOWED_USER_ID, chunk.replace(/[*_`]/g, '')).catch(() => {});
+      });
+    }
+  };
+
+  // Check for sprint builds: "@dev spend 8 hours building X"
+  const sprintMatch = devTask.match(/(?:spend\s+)?(\d+)\s*(?:hours?|hrs?)\s+(?:building|creating|making|on)\s+(.+)/i);
+  if (sprintMatch) {
+    const hours = parseInt(sprintMatch[1]);
+    const projectDesc = sprintMatch[2].trim();
+    const projectName = projectDesc.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).slice(0, 3).join('-') || 'project';
+    const projectDir = path.join(process.env.HOME, 'projects', projectName);
+    const result = tasks.launchSprintTask(projectDesc, projectDir, { sendResult, sprintMinutes: 30, totalHours: hours });
+    return;
+  }
+
+  const memory = loadMemory();
+  const context = `User memory summary: ${JSON.stringify(memory.core || {})}\nBrowser: node ~/nelson/nelson/lib/browse.js goto/screenshot/click/type/text/close\nProjects dir: ~/projects/`;
+  const result = tasks.launchTask(devTask, context, { sendResult, role: 'dev' });
+  if (result.blocked) return;
+  await h.sendReply(ctx, `🛠 *Nelson Dev* task launched: _${result.description}_\n\nID: \`${result.taskId}\`\nI'll message you when it's done.\n\nSend "tasks" to check status.`);
+});
+
+// Pattern: background task requests
+router.pattern(/^(?:go|please go|nelson go)\s+(.+)/i, 'Background task', async (ctx, h, match) => {
+  await h.launchBgTask(ctx, match[1].trim());
+});
+router.pattern(/^(?:background|bg|task)[:\s]+(.+)/i, 'Background task', async (ctx, h, match) => {
+  await h.launchBgTask(ctx, match[1].trim());
+});
+router.pattern(/^(?:in the background)[,:\s]+(.+)/i, 'Background task', async (ctx, h, match) => {
+  await h.launchBgTask(ctx, match[1].trim());
+});
+router.pattern(/^(?:autonomously|independently)[,:\s]+(.+)/i, 'Background task', async (ctx, h, match) => {
+  await h.launchBgTask(ctx, match[1].trim());
+});
+
+// Pattern: reboot
+const rebootKeywords = ['reboot', 'reboot the mac', 'full restart', 'restart the mac', 'restart mac mini', 'reboot mac mini', 'hard reset', 'do a reboot', 'do a full restart'];
+router.pattern(new RegExp(`(?:${rebootKeywords.map(k => k.replace(/\s+/g, '\\s+')).join('|')})`, 'i'), 'Reboot Mac Mini', async (ctx, h) => {
+  const REBOOT_SECONDS = 90;
+  const returnTime = new Date(Date.now() + REBOOT_SECONDS * 1000);
+  const timeStr = returnTime.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'Europe/London' });
+  await h.sendReply(ctx, `Rebooting the Mac Mini now. I should be back by ${timeStr} (~${REBOOT_SECONDS}s). See you on the other side.`).catch(() => {});
+  log.warn('Full reboot requested via Telegram');
+  releaseLock();
+  spawn('sudo', ['/sbin/reboot'], { detached: true, stdio: 'ignore' });
+  process.exit(0);
 });
 
 function startBot() {
