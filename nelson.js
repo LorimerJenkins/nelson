@@ -3,6 +3,8 @@ const { Telegraf } = require('telegraf');
 const { execSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const log = require('./lib/logger');
+const store = require('./lib/store');
 
 const BASE_DIR = __dirname;
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -21,6 +23,7 @@ const CONVERSATIONS_DIR = path.join(
 const os = require('os');
 const usage = require('./lib/usage');
 const tasks = require('./lib/tasks');
+const { hooks, retryWithBackoff, classifyError, ERROR_TYPES } = require('./lib/hooks');
 const https = require('https');
 const http = require('http');
 const processedMessages = new Set();
@@ -34,8 +37,8 @@ function acquireLock() {
     if (fs.existsSync(PID_FILE)) {
       const oldPid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim());
       try {
-        process.kill(oldPid, 0); // Check if process is alive
-        console.error(`Nelson already running (PID ${oldPid}). Exiting.`);
+        process.kill(oldPid, 0);
+        log.fatal('Nelson already running, exiting', { existingPid: oldPid });
         process.exit(0);
       } catch {
         // Old process is dead — stale PID file, safe to overwrite
@@ -43,6 +46,7 @@ function acquireLock() {
     }
   } catch {}
   fs.writeFileSync(PID_FILE, String(process.pid));
+  log.info('PID lock acquired', { pid: process.pid });
 }
 
 function releaseLock() {
@@ -54,8 +58,6 @@ function releaseLock() {
 
 function logError(type, message, context = '', diagnose = false) {
   try {
-    let errors = [];
-    try { errors = JSON.parse(fs.readFileSync(ERROR_LOG, 'utf8')); } catch {}
     const entry = {
       timestamp: new Date().toISOString(),
       type,
@@ -64,12 +66,18 @@ function logError(type, message, context = '', diagnose = false) {
       resolved: false,
       diagnosis: null
     };
-    errors.push(entry);
-    // Keep last 200 errors max
-    if (errors.length > 200) errors = errors.slice(-200);
-    fs.writeFileSync(ERROR_LOG, JSON.stringify(errors, null, 2));
-    if (diagnose) setImmediate(() => diagnoseError(errors.length - 1, entry));
-  } catch {}
+    // Use locked update to prevent concurrent corruption
+    store.updateSync(ERROR_LOG, (errors) => {
+      if (!Array.isArray(errors)) errors = [];
+      errors.push(entry);
+      if (errors.length > 200) errors = errors.slice(-200);
+      return errors;
+    }, []);
+    log.error('error logged', { errorType: type, message: String(message).slice(0, 200) });
+    if (diagnose) setImmediate(() => diagnoseError(-1, entry));
+  } catch (err) {
+    log.error('logError itself failed', { err: err.message });
+  }
 }
 
 function diagnoseError(index, entry) {
@@ -90,12 +98,18 @@ SEVERITY: <low/medium/high>
 Be specific — reference function names, line numbers, or exact changes needed. Keep it under 200 words.`;
 
       const diagnosis = (await callClaudeAsync(prompt, { timeout: 60000, callType: 'error_diagnosis' })).trim();
-      let errors = [];
-      try { errors = JSON.parse(fs.readFileSync(ERROR_LOG, 'utf8')); } catch {}
-      if (errors[index]) {
-        errors[index].diagnosis = diagnosis;
-        fs.writeFileSync(ERROR_LOG, JSON.stringify(errors, null, 2));
-      }
+      // Append diagnosis to the most recent matching error
+      await store.update(ERROR_LOG, (errors) => {
+        if (!Array.isArray(errors)) return errors;
+        // Find the last error matching this entry's timestamp
+        for (let i = errors.length - 1; i >= 0; i--) {
+          if (errors[i].timestamp === entry.timestamp && errors[i].type === entry.type) {
+            errors[i].diagnosis = diagnosis;
+            break;
+          }
+        }
+        return errors;
+      }, []);
       // Proactive alert — message Lorimer about the unhandled error
       if (botInstance && ALLOWED_USER_ID) {
         const time = entry.timestamp.split('T')[1].slice(0, 5);
@@ -105,7 +119,7 @@ Be specific — reference function names, line numbers, or exact changes needed.
         });
       }
     } catch (err) {
-      console.error('Error diagnosis failed:', err.message);
+      log.error('Error diagnosis failed', { err: err.message });
     }
   })();
 }
@@ -113,7 +127,7 @@ Be specific — reference function names, line numbers, or exact changes needed.
 acquireLock();
 
 if (!TOKEN || !ALLOWED_USER_ID) {
-  console.error('Missing required environment variables. Copy .env.example to .env and fill in your values.');
+  log.fatal('Missing required environment variables — copy .env.example to .env');
   process.exit(1);
 }
 
@@ -124,19 +138,20 @@ const saveMemoryLocked = memory_mod.saveMemoryLocked;
 const updateMemoryLocked = memory_mod.updateMemoryLocked;
 
 function loadHistory() {
-  try { return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); }
-  catch { return []; }
+  return store.load(HISTORY_FILE, []);
 }
 
 function saveHistory(history) {
-  fs.writeFileSync(HISTORY_FILE, JSON.stringify(history));
+  store.saveSync(HISTORY_FILE, history);
 }
 
 function addToHistory(role, text) {
-  const history = loadHistory();
-  history.push({ role, text: text.slice(0, 2000), timestamp: new Date().toISOString() });
-  while (history.length > MAX_HISTORY) history.shift();
-  saveHistory(history);
+  store.updateSync(HISTORY_FILE, (history) => {
+    if (!Array.isArray(history)) history = [];
+    history.push({ role, text: text.slice(0, 2000), timestamp: new Date().toISOString() });
+    while (history.length > MAX_HISTORY) history.shift();
+    return history;
+  }, []);
 }
 
 function loadTopics() {
@@ -165,13 +180,14 @@ function topicsBlock() {
 // --- Session management ---
 const { randomUUID } = require('crypto');
 
+const SESSIONS_DEFAULT = { sessions: {}, active_session: null };
+
 function loadSessions() {
-  try { return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); }
-  catch { return { sessions: {}, active_session: null }; }
+  return store.load(SESSIONS_FILE, SESSIONS_DEFAULT);
 }
 
 function saveSessions(data) {
-  fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+  store.saveSync(SESSIONS_FILE, data);
 }
 
 function getSession(name) {
@@ -421,6 +437,34 @@ function callClaudeAsync(input, { timeout = 300000, onProgress, sessionName, cal
 
 // updateTopicsInBackground removed — sessions handle topic context natively
 
+/**
+ * Wrapped Claude call with hook system, automatic retry, and circuit breaker.
+ * Use this instead of raw callClaudeAsync for user-facing calls.
+ */
+async function callClaudeWithRecovery(input, opts = {}) {
+  const { sessionName, callType = 'message' } = opts;
+  const context = { input, sessionName, callType, memoryFile: MEMORY_FILE };
+
+  return hooks.execute('claude_call', () => {
+    return retryWithBackoff(
+      () => callClaudeAsync(input, opts),
+      {
+        maxRetries: 2,
+        baseDelay: 2000,
+        maxDelay: 15000,
+        shouldRetry: (err) => {
+          const type = classifyError(err);
+          // Retry on transient errors only — not rate limits or timeouts (those need different handling)
+          return type === ERROR_TYPES.NETWORK || type === ERROR_TYPES.UNKNOWN;
+        },
+        onRetry: (err, attempt, delay) => {
+          log.warn('Claude call retry', { attempt: attempt + 1, delayMs: Math.round(delay), err: err.message.slice(0, 100) });
+        }
+      }
+    );
+  }, context);
+}
+
 function updateMemoryInBackground(text, result, memory) {
   // Use async calls so we don't block the event loop
   (async () => {
@@ -459,7 +503,7 @@ Assistant replied: ${assistantMsg.slice(0, 3000)}`;
       fs.writeFileSync(journalFile, `# Conversation Journal — ${dateStr}\n${entry}`);
     }
   } catch (err) {
-    console.error('Journal write failed:', err.message);
+    log.error('Journal write failed', { err: err.message });
     logError('journal_write', err.message, `Date: ${dateStr}`);
   }
 }
@@ -496,6 +540,45 @@ async function sendWithRetry(ctx, text, retries = 3) {
 
 let botInstance = null;
 
+// --- Hook-based recovery strategies ---
+
+// Session corruption: archive the broken session so caller can retry with fresh context
+hooks.on('claude_call', 'error', async (err, context) => {
+  if (classifyError(err) === ERROR_TYPES.SESSION_CORRUPT && context.sessionName) {
+    console.log(`Hook: session "${context.sessionName}" corrupted — archiving for rotation`);
+    archiveSession(context.sessionName);
+  }
+  return null;
+});
+
+// Rate limit: log usage hit
+hooks.on('claude_call', 'error', async (err, context) => {
+  if (classifyError(err) === ERROR_TYPES.RATE_LIMIT) {
+    usage.logLimitHit();
+    console.log('Hook: rate limit detected, logged usage hit');
+  }
+  return null;
+});
+
+// Memory backup on every successful write
+hooks.on('memory_write', 'after', async (result, context) => {
+  if (context.memoryFile && fs.existsSync(context.memoryFile)) {
+    try {
+      fs.copyFileSync(context.memoryFile, context.memoryFile + '.backup');
+    } catch (e) {
+      console.error('Memory backup failed:', e.message);
+    }
+  }
+});
+
+// Log all claude_call errors for diagnostics
+hooks.on('claude_call', 'error', async (err, context) => {
+  const type = classifyError(err);
+  console.log(`Hook: claude_call error [${type}]: ${err.message.slice(0, 200)}`);
+  logError(type, err.message, `callType: ${context.callType || 'unknown'}, session: ${context.sessionName || 'none'}`);
+  return null;
+});
+
 function startBot() {
   const bot = new Telegraf(TOKEN, { telegram: { timeout: 60000 } });
   botInstance = bot;
@@ -504,10 +587,10 @@ function startBot() {
     const msg = err.message || '';
     // Ignore benign polling timeouts — Telegraf retries automatically
     if (msg.includes('timed out') || msg.includes('ETIMEDOUT') || msg.includes('ECONNRESET') || msg.includes('network socket disconnected')) {
-      console.log('Transient network error (ignored):', msg);
+      log.info('Transient network error (ignored)', { err: msg });
       return;
     }
-    console.error('Bot error:', msg);
+    log.error('Bot framework error', { err: msg });
     logError('bot_framework', msg, err.stack ? err.stack.slice(0, 500) : '', true);
   });
 
@@ -572,7 +655,7 @@ function startBot() {
       try { fs.unlinkSync(tmpPath); } catch {}
     } catch (err) {
       clearInterval(typingInterval);
-      console.error('Photo handler error:', err.message);
+      log.error('Photo handler error', { err: err.message });
       logError('photo_handler', err.message, '', true);
       try { await sendWithRetry(ctx, 'Had trouble processing that image. Try again?'); } catch {}
     }
@@ -595,7 +678,7 @@ function startBot() {
                   newEmojis.includes('🎉') ? '🎉' : '👍';
       await botInstance.telegram.sendMessage(update.chat.id, ack).catch(() => {});
     } catch (err) {
-      console.error('Reaction handler error:', err.message);
+      log.warn('Reaction handler error', { err: err.message });
     }
   });
 
@@ -611,6 +694,9 @@ function startBot() {
       for (let i = 0; i < 100; i++) processedMessages.delete(iter.next().value);
     }
     const text = ctx.message.text;
+    const reqId = log.requestId();
+    const reqLog = log.child({ requestId: reqId, msgId, component: 'handler' });
+    reqLog.info('message received', { text: text.slice(0, 100) });
 
     // Top-level safety net — guarantees a reply no matter what goes wrong
     let repliedSuccessfully = false;
@@ -659,7 +745,7 @@ function startBot() {
 
     if (text.toLowerCase().trim() === 'restart') {
       await sendWithRetry(ctx, 'Restarting now...').catch(() => {});
-      console.log('Restart requested via Telegram');
+      log.info('Restart requested via Telegram');
       releaseLock();
       const child = spawn(process.execPath, [__filename], {
         detached: true,
@@ -690,6 +776,28 @@ function startBot() {
     if (text.toLowerCase().trim() === 'usage') {
       const report = usage.formatUsageReport();
       await sendWithRetry(ctx, report);
+      return;
+    }
+
+    if (text.toLowerCase().trim() === 'hookstatus') {
+      const stats = hooks.getStats();
+      let msg = '*Hook System Status*\n\n';
+      msg += `Calls: ${stats.totalCalls} | Errors: ${stats.totalErrors} | Recoveries: ${stats.totalRecoveries}\n\n`;
+      if (Object.keys(stats.errorsByType).length > 0) {
+        msg += '*Errors by type:*\n';
+        for (const [type, count] of Object.entries(stats.errorsByType)) {
+          msg += `• \`${type}\`: ${count}\n`;
+        }
+        msg += '\n';
+      }
+      if (Object.keys(stats.circuitBreakers).length > 0) {
+        msg += '*Circuit breakers:*\n';
+        for (const [name, cb] of Object.entries(stats.circuitBreakers)) {
+          const icon = cb.state === 'closed' ? '🟢' : cb.state === 'open' ? '🔴' : '🟡';
+          msg += `${icon} \`${name}\`: ${cb.state} (${cb.failures} failures)\n`;
+        }
+      }
+      await sendWithRetry(ctx, msg);
       return;
     }
 
@@ -816,7 +924,7 @@ function startBot() {
       const returnTime = new Date(Date.now() + REBOOT_SECONDS * 1000);
       const timeStr = returnTime.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZone: 'Europe/London' });
       await sendWithRetry(ctx, `Rebooting the Mac Mini now. I should be back by ${timeStr} (~${REBOOT_SECONDS}s). See you on the other side.`).catch(() => {});
-      console.log('Full reboot requested via Telegram');
+      log.warn('Full reboot requested via Telegram');
       releaseLock();
       spawn('sudo', ['/sbin/reboot'], { detached: true, stdio: 'ignore' });
       process.exit(0);
@@ -888,7 +996,7 @@ function startBot() {
       } catch (retryErr) {
         // Session rotation — if the session failed, archive it, create fresh, and retry once
         if (retryErr.sessionFailed) {
-          console.log(`Session "${activeSessionName}" failed — rotating to new session`);
+          log.warn('Session failed, rotating', { session: activeSessionName });
           archiveSession(activeSessionName);
           // Retry with full context since it's a fresh session
           const freshPrompt = `Here is your memory of the user:\n${JSON.stringify(memory)}${journalBlock}${historyBlock}${replyContext}${topicSwitchNotice}\n\nUser says: ${text}`;
@@ -939,7 +1047,7 @@ function startBot() {
           await ctx.reply(reply);
           repliedSuccessfully = true;
         } catch (finalErr) {
-          console.error('CRITICAL: Failed to send ANY reply:', finalErr.message);
+          log.fatal('Failed to send ANY reply', { err: finalErr.message });
           logError('reply_failure', finalErr.message, `Reply was: ${reply}`);
         }
       }
@@ -947,7 +1055,7 @@ function startBot() {
 
     } catch (outerErr) {
       // Top-level safety net — no matter what goes wrong, always try to reply
-      console.error('Top-level handler error:', outerErr.message);
+      log.error('Top-level handler crash', { err: outerErr.message });
       logError('handler_crash', outerErr.message, outerErr.stack ? outerErr.stack.slice(0, 500) : '', true);
       if (!repliedSuccessfully) {
         try { await ctx.reply('Something went wrong internally. Try again or send "restart" if I seem stuck.'); } catch {}
@@ -958,20 +1066,20 @@ function startBot() {
   // Log all raw updates for debugging
   bot.use((ctx, next) => {
     const updateType = Object.keys(ctx.update).filter(k => k !== 'update_id').join(', ');
-    console.log(`Update received — type: ${updateType}`);
+    log.debug('Update received', { type: updateType });
     return next();
   });
 
   bot.launch({
     allowedUpdates: ['message', 'message_reaction', 'message_reaction_count', 'callback_query']
   }).then(() => {
-    console.log('Nelson is live.');
+    log.info('Nelson is live');
     bot.telegram.sendMessage(ALLOWED_USER_ID, 'Nelson is online.').catch(() => {});
   }).catch(err => {
-    console.error('Bot crashed:', err.message);
+    log.error('Bot launch failed', { err: err.message });
     // 409 = another instance still connected — wait longer for Telegram to release
     const delay = err.message.includes('409') ? 60000 : 30000;
-    console.log(`Retrying in ${delay / 1000}s...`);
+    log.info('Retrying bot launch', { delayMs: delay });
     setTimeout(startBot, delay);
   });
 
@@ -980,33 +1088,18 @@ function startBot() {
 }
 
 process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err.message);
+  log.fatal('Uncaught exception', { err: err.message });
   logError('uncaughtException', err.message, err.stack ? err.stack.slice(0, 500) : '', true);
 });
 
 process.on('unhandledRejection', (err) => {
-  console.error('Unhandled rejection:', err);
+  log.fatal('Unhandled rejection', { err: String(err) });
   logError('unhandledRejection', String(err), err && err.stack ? err.stack.slice(0, 500) : '', true);
 });
 
 // Log rotation — keep nelson.log under 5MB, retain 2 old copies
 function rotateLogIfNeeded() {
-  const logFile = path.join(BASE_DIR, 'nelson.log');
-  try {
-    if (!fs.existsSync(logFile)) return;
-    const stats = fs.statSync(logFile);
-    if (stats.size < 5 * 1024 * 1024) return; // Under 5MB, no action
-    // Rotate: .2 → delete, .1 → .2, current → .1
-    const log2 = logFile + '.2';
-    const log1 = logFile + '.1';
-    try { fs.unlinkSync(log2); } catch {}
-    try { fs.renameSync(log1, log2); } catch {}
-    fs.renameSync(logFile, log1);
-    fs.writeFileSync(logFile, ''); // Fresh log
-    console.log('Log rotated — nelson.log exceeded 5MB');
-  } catch (err) {
-    console.error('Log rotation failed:', err.message);
-  }
+  log.rotateIfNeeded();
 }
 
 // Daily health check — runs at 8am UK time
@@ -1021,7 +1114,7 @@ function scheduleDailyHealthCheck() {
 
   async function runHealthCheck() {
     const today = new Date().toISOString().split('T')[0];
-    console.log(`[${today}] Running daily health check...`);
+    log.info('Running daily health check', { date: today });
 
     // Rotate log if oversized
     rotateLogIfNeeded();
@@ -1075,9 +1168,9 @@ Keep it under 500 words. Only flag real issues.`;
       report = await callClaudeAsync(diagnosePrompt, { timeout: 300000, callType: 'health_check' });
       const reportFile = path.join(REPORTS_DIR, `${today}.md`);
       fs.writeFileSync(reportFile, `# Daily Health Report — ${today}\n\n${report}`);
-      console.log(`Health report saved to ${reportFile}`);
+      log.info('Health report saved', { file: reportFile });
     } catch (err) {
-      console.error('Health check diagnosis failed:', err.message);
+      log.error('Health check diagnosis failed', { err: err.message });
       logError('health_check', err.message, 'Health check diagnosis phase failed');
       setTimeout(runHealthCheck, msUntilNext8am());
       return;
@@ -1137,7 +1230,7 @@ function scheduleDailyUpdater() {
   }
 
   function runUpdater() {
-    console.log('Running daily updater...');
+    log.info('Running daily updater');
     const sendResult = (message) => {
       if (botInstance && ALLOWED_USER_ID) {
         const chunks = chunkText(message);
@@ -1178,7 +1271,7 @@ function scheduleDailyLifeSync() {
   }
 
   function runLifeSync() {
-    console.log('Running daily life sync...');
+    log.info('Running daily life sync');
     const sendResult = (message) => {
       // The result should be updated memory JSON — save it
       try {
@@ -1187,7 +1280,7 @@ function scheduleDailyLifeSync() {
           const updated = JSON.parse(jsonMatch[0]);
           if (updated.core && updated.core.name) {
             saveMemory(updated);
-            console.log('Life sync: memory.json updated');
+            log.info('Life sync: memory.json updated');
             if (botInstance && ALLOWED_USER_ID) {
               const summary = updated.life_context
                 ? `🔄 *Memory synced*\n\n${updated.life_context.week_summary || 'Updated.'}\n${updated.life_context.urgent ? `\n⚠️ *Urgent:* ${updated.life_context.urgent}` : ''}`
@@ -1199,7 +1292,7 @@ function scheduleDailyLifeSync() {
           }
         }
       } catch (err) {
-        console.error('Life sync parse failed:', err.message);
+        log.error('Life sync parse failed', { err: err.message });
         if (botInstance && ALLOWED_USER_ID) {
           botInstance.telegram.sendMessage(ALLOWED_USER_ID, '🔄 Life sync ran but failed to update memory. Check logs.').catch(() => {});
         }
@@ -1216,7 +1309,7 @@ function scheduleDailyLifeSync() {
   setTimeout(runLifeSync, msUntilNext7am());
 }
 
-console.log('Nelson is running...');
+log.info('Nelson starting up', { pid: process.pid });
 startBot();
 scheduleDailyHealthCheck();
 scheduleDailyUpdater();
