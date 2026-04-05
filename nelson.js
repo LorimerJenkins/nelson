@@ -972,9 +972,9 @@ function startBot() {
     }, 30000);
 
     try {
-      const history = loadHistory().slice(-10);
+      const history = loadHistory().slice(-5);
       const historyBlock = history.length > 0
-        ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text.slice(0, 500)}`).join('\n')}`
+        ? `\n\nRecent conversation:\n${history.map(m => `${m.role}: ${m.text.slice(0, 300)}`).join('\n')}`
         : '';
       const journalBlock = loadRecentJournals();
       // Reply context — if Lorimer is replying to a specific message, include it
@@ -1044,8 +1044,15 @@ function startBot() {
       if (warning) await sendWithRetry(ctx, warning).catch(() => {});
       repliedSuccessfully = true;
       touchActivity();
-      // Memory and topics updates removed — saves ~15k tokens per message
-      // Memory updates happen on session close instead
+      // Auto-rotate session at 15 messages to prevent token bloat
+      const currentSession = getSession(activeSessionName);
+      if (currentSession && currentSession.message_count >= 15) {
+        archiveSession(activeSessionName);
+        const data = loadSessions();
+        data.active_session = null;
+        saveSessions(data);
+        log.info('Session auto-rotated', { session: activeSessionName, messages: currentSession.message_count });
+      }
     } catch (err) {
       clearTimeout(progressTimer);
       touchActivity();
@@ -1056,7 +1063,37 @@ function startBot() {
       if (errorType === ERROR_TYPES.TIMEOUT) {
         reply = 'That was too complex — I hit my time limit. Try breaking it into a simpler question.';
       } else if (errorType === ERROR_TYPES.RATE_LIMIT) {
-        reply = 'Claude usage limit reached — I\'ll be back once it resets.';
+        usage.logLimitHit();
+        // Auto-retry: wait 5 minutes and try once more
+        await sendWithRetry(ctx, '⏸️ Token limit hit. Waiting 5 minutes then retrying automatically...').catch(() => {});
+        await new Promise(r => setTimeout(r, 5 * 60 * 1000));
+        try {
+          const retryResult = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
+          addToHistory('User', text);
+          addToHistory('Assistant', retryResult);
+          const retryChunks = chunkText(retryResult);
+          for (const chunk of retryChunks) await sendWithRetry(ctx, chunk);
+          repliedSuccessfully = true;
+          touchActivity();
+          return;
+        } catch (retryErr2) {
+          // Still limited — wait longer
+          await sendWithRetry(ctx, '⏸️ Still limited. Waiting 15 more minutes...').catch(() => {});
+          await new Promise(r => setTimeout(r, 15 * 60 * 1000));
+          try {
+            const retry2Result = await callClaudeWithRecovery(prompt, { timeout: 300000, sessionName: activeSessionName });
+            addToHistory('User', text);
+            addToHistory('Assistant', retry2Result);
+            const retry2Chunks = chunkText(retry2Result);
+            for (const chunk of retry2Chunks) await sendWithRetry(ctx, chunk);
+            repliedSuccessfully = true;
+            touchActivity();
+            return;
+          } catch {
+            // Give up after two retries
+          }
+        }
+        reply = 'Token limit still active after retrying. I\'ll be back once it fully resets.';
       } else if (errorType === ERROR_TYPES.NETWORK) {
         reply = 'Network issue — try again in a moment.';
       } else if (errorType === ERROR_TYPES.SESSION_CORRUPT) {
