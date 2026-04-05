@@ -1156,8 +1156,58 @@ Produce a Telegram report: max 5 suggestions ranked by impact. Each needs: What 
   setTimeout(runUpdater, msUntilNext9am());
 }
 
+// Daily life sync — runs at 7am UK time, refreshes memory from Gmail/Calendar/journals
+function scheduleDailyLifeSync() {
+  function msUntilNext7am() {
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(7, 0, 0, 0);
+    if (now >= next) next.setDate(next.getDate() + 1);
+    return next - now;
+  }
+
+  function runLifeSync() {
+    console.log('Running daily life sync...');
+    const sendResult = (message) => {
+      // The result should be updated memory JSON — save it
+      try {
+        const jsonMatch = message.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const updated = JSON.parse(jsonMatch[0]);
+          if (updated.core && updated.core.name) {
+            saveMemory(updated);
+            console.log('Life sync: memory.json updated');
+            if (botInstance && ALLOWED_USER_ID) {
+              const summary = updated.life_context
+                ? `🔄 *Memory synced*\n\n${updated.life_context.week_summary || 'Updated.'}\n${updated.life_context.urgent ? `\n⚠️ *Urgent:* ${updated.life_context.urgent}` : ''}`
+                : '🔄 Memory synced.';
+              botInstance.telegram.sendMessage(ALLOWED_USER_ID, summary, { parse_mode: 'Markdown' }).catch(() => {
+                botInstance.telegram.sendMessage(ALLOWED_USER_ID, summary.replace(/[*_`]/g, '')).catch(() => {});
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Life sync parse failed:', err.message);
+        if (botInstance && ALLOWED_USER_ID) {
+          botInstance.telegram.sendMessage(ALLOWED_USER_ID, '🔄 Life sync ran but failed to update memory. Check logs.').catch(() => {});
+        }
+      }
+    };
+    tasks.launchTask(
+      'Daily life sync — refresh memory from Gmail, Calendar, and conversations',
+      `Read the current memory.json from ~/nelson/nelson/memory.json. Then scan Gmail (last 24h emails), Google Calendar (next 7 days), and conversation journals. Update the memory JSON with fresh life_context, any new people, updated priorities, and upcoming events. Return ONLY the full updated memory.json as valid JSON.`,
+      { sendResult, role: 'lifesync', timeout: 300000 }
+    );
+    setTimeout(runLifeSync, msUntilNext7am());
+  }
+
+  setTimeout(runLifeSync, msUntilNext7am());
+}
+
 console.log('Nelson is running...');
 startBot();
 scheduleDailyHealthCheck();
 scheduleDailyUpdater();
+scheduleDailyLifeSync();
 startWatchdog();
